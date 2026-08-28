@@ -89,13 +89,35 @@ class RndTrigger:
             result=[]
             for row in rows:
                 item=dict(row)
-                for key in ("budget_plan_json","checkpoint_json","project_state_json","failure_state_json"):
+                for key in ("budget_plan_json","checkpoint_json","project_state_json","failure_state_json","dsh_phase_progress_json"):
                     try:item[key.removesuffix("_json")]=json.loads(item.pop(key) or "{}")
                     except (TypeError,json.JSONDecodeError):item[key.removesuffix("_json")]={}
                 used=int(conn.execute("SELECT COALESCE(SUM(total_tokens),0) FROM token_usage WHERE ledger='rnd' AND cycle_id=?",(item["cycle_id"],)).fetchone()[0])
                 item["used_tokens"]=used;item["remaining_tokens"]=max(0,int(item["token_budget"])-used)
+                artifact_root=Path(str(item.get("artifact_dir") or ""))
+                try:
+                    artifact_root=artifact_root.resolve()
+                    artifact_root.relative_to(self.handoff_root.resolve())
+                except (OSError,ValueError):
+                    artifact_root=None
+                manifest=self._read_artifact_json(artifact_root,"handoff_manifest.json")
+                rnd_result=self._read_artifact_json(artifact_root,"output/rnd_result.json")
+                item["result"]=rnd_result
+                item["final_validator"]=dict(rnd_result.get("final_validator") or {})
+                item["artifacts"]=list(manifest.get("artifacts") or [])
+                item["artifact_count"]=len(item["artifacts"])
                 result.append(item)
             return result
+
+    @staticmethod
+    def _read_artifact_json(root:Path|None,relative:str)->dict:
+        if root is None:return {}
+        try:
+            target=(root/relative).resolve();target.relative_to(root)
+            value=json.loads(target.read_text(encoding="utf-8"))
+            return value if isinstance(value,dict) else {}
+        except (OSError,ValueError,json.JSONDecodeError):
+            return {}
     def list(self)->list[dict]:
         return self.list_cycles()
 

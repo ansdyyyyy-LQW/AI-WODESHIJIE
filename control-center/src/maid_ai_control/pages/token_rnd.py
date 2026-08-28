@@ -29,6 +29,11 @@ PHASE_TEXT = {
     "TESTING": "正在测试",
     "FIXING": "正在修正",
     "FINALIZING": "正在整理成果",
+    "RESEARCH": "正在查资料",
+    "DESIGN": "正在设计",
+    "DEVELOPMENT": "正在制作",
+    "BUILD_FIX": "正在构建和修正",
+    "FINALIZE": "正在整理最终成果",
 }
 
 
@@ -88,6 +93,8 @@ class TokenRndPage(Page):
                 ("cycle_day", "当前游戏日"),
                 ("feasible", "本轮能否完成"),
                 ("staging", "是否需要分阶段"),
+                ("harness", "研发环境"),
+                ("validator", "最终验证"),
             ]
         ):
             card = Card(title)
@@ -105,9 +112,12 @@ class TokenRndPage(Page):
         self.result_state.setWordWrap(True)
         self.user_action = QLabel("暂时不需要操作")
         self.user_action.setWordWrap(True)
+        self.artifact_state = QLabel("—")
+        self.artifact_state.setWordWrap(True)
         result_form.addRow("成果名称", self.result_name)
         result_form.addRow("用途", self.result_use)
         result_form.addRow("结果", self.result_state)
+        result_form.addRow("交付文件", self.artifact_state)
         result_form.addRow("你需要做什么", self.user_action)
         result_buttons = QHBoxLayout()
         self.open_folder_button = QPushButton("打开成果文件夹")
@@ -183,7 +193,17 @@ class TokenRndPage(Page):
     def update_rnd(self, data: dict[str, Any]) -> None:
         cycles = list(data.get("cycles") or [])
         self.latest_cycle = dict(cycles[0]) if cycles else {}
-        phase = str(self.latest_cycle.get("phase") or "")
+        readiness = dict(data.get("readiness") or {})
+        dsh = dict(readiness.get("deepseek_harness") or {})
+        proxy = dict(dsh.get("api_budget_proxy") or {})
+        if dsh.get("available"):
+            harness_text = f"可用 · {dsh.get('version') or '版本已锁定'}"
+            if not proxy.get("available"):
+                harness_text += " · 等待研发 API"
+        else:
+            harness_text = "不可用"
+        self.rnd_cards["harness"].set_value(harness_text)
+        phase = str(self.latest_cycle.get("dsh_current_phase") or self.latest_cycle.get("phase") or "")
         status = str(self.latest_cycle.get("status") or "")
         outcome = str(self.latest_cycle.get("outcome") or "")
         phase_text = "已暂停，AI 服务启动后会继续" if status == "SUSPENDED" else {"COMPLETED": "完成", "STAGE_COMPLETED": "本阶段完成", "FAILED": "失败", "WAITING_USER": "等待用户操作"}.get(outcome, PHASE_TEXT.get(phase, "等待下一个研发日" if not status else "正在准备"))
@@ -192,7 +212,9 @@ class TokenRndPage(Page):
             self.result_name.setText("还没有研发成果")
             self.result_use.setText("—")
             self.result_state.setText("—")
+            self.artifact_state.setText("—")
             self.user_action.setText("暂时不需要操作")
+            self.rnd_cards["validator"].set_value("等待研发结果")
             for button in (self.open_folder_button, self.readme_button, self.test_button, self.handled_button):
                 button.setEnabled(False)
             self.ids.setText("周期编号：—")
@@ -208,6 +230,16 @@ class TokenRndPage(Page):
         self.result_name.setText(direction)
         self.result_use.setText(value)
         self.result_state.setText("已安全暂停，启动后自动继续" if status == "SUSPENDED" else OUTCOME_TEXT.get(outcome, PHASE_TEXT.get(phase, "正在进行")))
+        validator = dict(self.latest_cycle.get("final_validator") or {})
+        if validator.get("ok") is True:
+            validator_text = "通过"
+        elif validator.get("ok") is False:
+            validator_text = "未通过"
+        else:
+            validator_text = "等待验证"
+        self.rnd_cards["validator"].set_value(validator_text)
+        artifact_count = int(self.latest_cycle.get("artifact_count") or 0)
+        self.artifact_state.setText(f"{artifact_count} 个已登记文件" if artifact_count else "尚无已登记文件")
         handled = bool(self.latest_cycle.get("handled"))
         if outcome == "WAITING_USER":
             user_action = "请查看说明和测试结果，再决定是否继续"
@@ -223,7 +255,14 @@ class TokenRndPage(Page):
         self.readme_button.setEnabled(bool(str(artifact)))
         self.test_button.setEnabled(bool(str(artifact)))
         self.handled_button.setEnabled(bool(outcome) and not handled)
-        self.ids.setText(f"周期编号：{self.latest_cycle.get('cycle_id', '—')}\n项目编号：{self.latest_cycle.get('project_id', '—')}")
+        self.ids.setText(
+            f"周期编号：{self.latest_cycle.get('cycle_id', '—')}\n"
+            f"项目编号：{self.latest_cycle.get('project_id', '—')}\n"
+            f"DSH 版本：{self.latest_cycle.get('dsh_version') or '—'}\n"
+            f"DSH 会话：{self.latest_cycle.get('dsh_session_id') or '—'}\n"
+            f"隔离目录：{self.latest_cycle.get('dsh_workspace') or '—'}\n"
+            f"源码基线：{self.latest_cycle.get('baseline_commit') or '—'}"
+        )
 
     def research(self) -> None:
         values = [x.strip() for x in self.queries.text().replace("，", ",").split(",") if x.strip()]
@@ -281,7 +320,7 @@ class TokenRndPage(Page):
         root = self._artifact()
         if not root:
             return
-        for name in ("README.md", "readme.md", "rnd_result.json", "summary.md"):
+        for name in ("output/rnd_result.json", "RND_REPORT.md", "README.md", "readme.md", "rnd_result.json", "summary.md"):
             candidate = root / name
             if candidate.exists():
                 self._open(candidate)
@@ -292,7 +331,7 @@ class TokenRndPage(Page):
         root = self._artifact()
         if not root:
             return
-        for name in ("test-results", "test_result.json", "build_report.json", "rnd_result.json"):
+        for name in ("output/final-validator/runner_result.json", "output/final_validator_result.json", "validation/test-results.txt", "test-results", "test_result.json", "build_report.json", "rnd_result.json"):
             candidate = root / name
             if candidate.exists():
                 self._open(candidate)

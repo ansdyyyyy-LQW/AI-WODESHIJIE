@@ -30,3 +30,4 @@ packages = ["src/maid_agent"]
 [tool.hatch.build.targets.wheel.force-include]
 "src/maid_agent/prompts/runtime_system.md" = "maid_agent/prompts/runtime_system.md"
 "src/maid_agent/prompts/rnd_system.md" = "maid_agent/prompts/rnd_system.md"
+"src/maid_agent/prompts/rnd_coding_harness.md" = "maid_agent/prompts/rnd_coding_harness.md"

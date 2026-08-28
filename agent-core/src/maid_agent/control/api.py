@@ -110,6 +110,9 @@ class ControlApi:
             return self.ledger.snapshot(current_day=current_day,rnd_budget=cycle_budget,current_cycle_id=cycle_id,runtime_stage_start_day=stage_start)
         if command=="GET_LLM_TELEMETRY":return {"requests":self.store.recent_llm_requests(limit=min(int(args.get("limit",100)),1000))}
         if command=="GET_RND":return {"readiness":self.runtime.rnd_service.readiness() if self.runtime.rnd_service else {"mode":"DISABLED"},"cycles":self.rnd_trigger.list_cycles(limit=100),"candidate_skills":self.skills.list(status="CANDIDATE",limit=500)}
+        if command=="CHECK_RND_HARNESS":
+            if self.runtime.rnd_service is None:raise RuntimeError("AI研发环境未启用")
+            return {"readiness":{"deepseek_harness":await self.runtime.rnd_service.check_harness_environment()}}
         if command=="MARK_RND_HANDLED":
             cycle_id=str(args.get("cycle_id") or "")
             if not cycle_id:raise ValueError("缺少研发周期")

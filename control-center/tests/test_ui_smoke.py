@@ -53,6 +53,22 @@ def test_03_four_pages_plain_text_and_button_routes(tmp_path:Path,monkeypatch):
     assert "{" not in filtered and "11111111" not in filtered and "继续任务" in filtered
     control.update_status({"mode":"RUNNING","bridge_connected":True,"bound_maid_uuid":"maid","game_day":2,"snapshot":{"maid_name":"小女仆","day":2,"time_of_day":6000,"health":18,"max_health":20,"dimension":"minecraft:overworld","position":{"x":1,"y":64,"z":2}},"nearby_threats":[],"plan":{"steps":[]},"start_gate":{"ready":True,"missing":[]}})
     assert control.cards["maid"].value.text()=="小女仆" and "第 2 天" in control.cards["time"].value.text()
+    token.update_rnd({
+        "readiness":{"deepseek_harness":{"available":True,"version":"0.1.1-rc.2","api_budget_proxy":{"available":True}}},
+        "cycles":[{
+            "cycle_id":"cycle-001","status":"COMPLETED","outcome":"COMPLETED",
+            "dsh_current_phase":"FINALIZE","dsh_version":"0.1.1-rc.2",
+            "dsh_session_id":"session-1","dsh_workspace":str(tmp_path/"workspace"),
+            "baseline_commit":"abc123","artifact_dir":str(tmp_path/"handoff"),
+            "artifact_count":2,"final_validator":{"ok":True},
+        }],
+    })
+    assert "0.1.1-rc.2" in token.rnd_cards["harness"].value.text()
+    assert token.rnd_cards["validator"].value.text()=="通过"
+    assert token.artifact_state.text()=="2 个已登记文件"
+    window.settings_page.update_harness_readiness({"readiness":{"deepseek_harness":{"available":True,"startup":True,"version":"0.1.1-rc.2"}}})
+    assert window.settings_page.harness_status.text()=="启动检查通过"
+    assert window.settings_page.harness_version.text()=="0.1.1-rc.2"
 
     forbidden=("Bridge","Runtime","Goal","Plan","PlanStep","Action","ThreatAnalytics","Token Ledger","R&D Harness","Start Gate","Postcondition","Checkpoint","UUID","JSON","Worktree","Runner","Patch","Candidate")
     skipped={maid.technical,token.advanced,window.settings_page.advanced}

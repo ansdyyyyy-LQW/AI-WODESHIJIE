@@ -14,6 +14,11 @@ VERSION = "0.3.0"
 DIST_ROOT = ROOT / "dist"
 DIST = DIST_ROOT / "MaidAI"
 BUILD = ROOT / "build" / "pyinstaller"
+DSH_LOCK = ROOT / "references" / "DEEPSEEK_HARNESS_LOCK.json"
+SOURCE_EXCLUDED = {
+    ".git", ".venv", ".runtime", ".gradle", "build", "dist", "run", "validation",
+    "__pycache__", ".pytest_cache", ".test-temp", ".test-tmp", ".tools", "node_modules",
+}
 
 
 def sha256(path: Path) -> str:
@@ -32,12 +37,121 @@ def run_spec(name: str) -> None:
     ], check=True, cwd=ROOT)
 
 
+def run_tool(command: list[str], *, cwd: Path = ROOT) -> None:
+    subprocess.run(command, check=True, cwd=cwd)
+
+
+def reparse_points(root: Path) -> list[Path]:
+    found: list[Path] = []
+    for directory, directories, filenames in os.walk(root, topdown=True):
+        base = Path(directory)
+        safe_directories: list[str] = []
+        for name in directories:
+            path = base / name
+            is_reparse = path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction())
+            if is_reparse:
+                found.append(path)
+            else:
+                safe_directories.append(name)
+        directories[:] = safe_directories
+        for name in filenames:
+            path = base / name
+            if path.is_symlink():
+                found.append(path)
+    return found
+
+
+def bundle_deepseek_harness(destination: Path) -> dict[str, str]:
+    lock = json.loads(DSH_LOCK.read_text(encoding="utf-8"))
+    node = Path(shutil.which("node.exe") or shutil.which("node") or "")
+    pnpm = Path(shutil.which("pnpm.cmd") or shutil.which("pnpm") or "")
+    if not node.is_file() or not pnpm.is_file():
+        raise SystemExit("Node or pnpm is unavailable; cannot build the bundled DeepSeek Harness")
+    node_version = subprocess.check_output([str(node), "--version"], text=True, encoding="utf-8").strip().lstrip("v")
+    if node_version != str(lock.get("node_version") or ""):
+        raise SystemExit(f"Bundled Node version mismatch: expected {lock.get('node_version')}, got {node_version}")
+
+    dsh_root = destination / "_internal" / "dsh"
+    profile = dsh_root / "maidai-profile"
+    node_dir = dsh_root / "node"
+    if dsh_root.exists():
+        shutil.rmtree(dsh_root)
+    node_dir.mkdir(parents=True)
+    shutil.copy2(node, node_dir / "node.exe")
+    source = ROOT / "dsh-integration"
+    profile.mkdir(parents=True)
+    for directory in ("lib", "profile"):
+        shutil.copytree(source / directory, profile / directory)
+    for filename in (
+        "cordis.patch.yml", "package.json", "README.md", "pnpm-lock.yaml", "pnpm-workspace.yaml",
+    ):
+        shutil.copy2(source / filename, profile / filename)
+    # A normal pnpm Windows install uses absolute junction targets. They work
+    # only on the build machine, so the distributable uses real hoisted files.
+    (profile / ".npmrc").write_text("node-linker=hoisted\n", encoding="utf-8")
+    run_tool([
+        str(pnpm), "--dir", str(profile), "--config.node-linker=hoisted",
+        "install", "--prod", "--frozen-lockfile",
+    ])
+    links = reparse_points(profile / "node_modules")
+    if links:
+        raise SystemExit(
+            "Bundled DeepSeek Harness contains non-portable links: "
+            + ", ".join(str(path) for path in links[:10])
+        )
+    references = profile / "references"
+    references.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(DSH_LOCK, references / DSH_LOCK.name)
+    required = [
+        profile / "lib" / "launcher.js",
+        profile / "node_modules" / "@deepseek-ai" / "dsh" / "package.json",
+        profile / "node_modules" / "@deepseek-ai" / "dsh-agent" / "package.json",
+        references / DSH_LOCK.name,
+        node_dir / "node.exe",
+    ]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise SystemExit("Bundled DeepSeek Harness is incomplete: " + ", ".join(missing))
+    package = json.loads((profile / "node_modules" / "@deepseek-ai" / "dsh" / "package.json").read_text(encoding="utf-8"))
+    if str(package.get("version") or "") != str(lock.get("version") or ""):
+        raise SystemExit("Deployed DSH package does not match the locked version")
+    return {"node": node_version, "dsh": str(lock["version"]), "profile": str(lock["profile_version"])}
+
+
 def copy_source_workspace(destination: Path) -> None:
-    excluded = {".git", ".venv", ".runtime", ".gradle", "build", "dist", "run", "validation", "__pycache__", ".pytest_cache", ".test-temp", ".tools"}
+    dsh_root = (ROOT / "dsh-integration").resolve()
+    def ignored(directory: str, names: list[str]) -> set[str]:
+        result = {name for name in names if name in SOURCE_EXCLUDED}
+        if Path(directory).resolve() == dsh_root:
+            result.add("lib")
+        return result
     shutil.copytree(
         ROOT, destination,
-        ignore=lambda _directory, names: {name for name in names if name in excluded},
+        ignore=ignored,
     )
+
+
+def source_files() -> list[Path]:
+    files: list[Path] = []
+    for directory, directories, filenames in os.walk(ROOT, topdown=True):
+        base = Path(directory)
+        relative_base = base.relative_to(ROOT)
+        directories[:] = [
+            name for name in directories
+            if name not in SOURCE_EXCLUDED
+            and not (relative_base == Path("dsh-integration") and name == "lib")
+        ]
+        files.extend(base / name for name in filenames)
+    return files
+
+
+def write_source_zip() -> Path:
+    source_zip = DIST_ROOT / f"MaidAI-Complete-Source-{VERSION}.zip"
+    DIST_ROOT.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(source_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        for path in source_files():
+            archive.write(path, Path(f"MaidAI-Source-{VERSION}") / path.relative_to(ROOT))
+    return source_zip
 
 
 def main() -> None:
@@ -63,6 +177,7 @@ def main() -> None:
             raise SystemExit(f"PyInstaller output missing: {required}")
 
     shutil.copytree(gui, DIST)
+    dsh_versions = bundle_deepseek_harness(DIST)
     agent_dir = DIST / "resources" / "MaidAgent"
     rnd_dir = DIST / "resources" / "rnd-harness"
     agent_dir.mkdir(parents=True, exist_ok=True)
@@ -80,6 +195,7 @@ def main() -> None:
         "product": "Maid AI", "version": VERSION,
         "minecraft": "1.20.1", "forge": "[47.4.0,48)", "forge_detection": "47.x",
         "bridge_declared_forge": "[47.4.0,48)", "bridge_build_forge": "47.4.23", "tlm": "1.5.3",
+        "deepseek_harness": dsh_versions,
         "artifacts": [],
     }
     for path in sorted(p for p in DIST.rglob("*") if p.is_file()):
@@ -99,15 +215,13 @@ def main() -> None:
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for path in DIST.rglob("*"):
             if path.is_file(): archive.write(path, Path("MaidAI") / path.relative_to(DIST))
-    source_zip = DIST_ROOT / f"MaidAI-Complete-Source-{VERSION}.zip"
-    source_excluded = {".git", ".venv", ".runtime", ".gradle", "build", "dist", "run", "validation", "__pycache__", ".pytest_cache", ".test-temp", ".tools"}
-    with zipfile.ZipFile(source_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-        for path in ROOT.rglob("*"):
-            if path.is_file() and not any(part in source_excluded for part in path.relative_to(ROOT).parts):
-                archive.write(path, Path(f"MaidAI-Source-{VERSION}") / path.relative_to(ROOT))
+    source_zip = write_source_zip()
     print(zip_path)
     print(source_zip)
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--source-only"]:
+        print(write_source_zip())
+    else:
+        main()

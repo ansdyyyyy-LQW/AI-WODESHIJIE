@@ -39,6 +39,14 @@ class RndOutcome(StrEnum):
     WAITING_USER = "WAITING_USER"
 
 
+class RndDevelopmentTarget(StrEnum):
+    MAIDAI_SOURCE = "MAIDAI_SOURCE"
+    NEW_FORGE_ADDON = "NEW_FORGE_ADDON"
+    SKILL = "SKILL"
+    EXTERNAL_MOD_RESEARCH = "EXTERNAL_MOD_RESEARCH"
+    RESEARCH_ONLY = "RESEARCH_ONLY"
+
+
 class RndContinuationDecision(StrEnum):
     NEW = "NEW"
     CONTINUE = "CONTINUE"
@@ -61,6 +69,7 @@ class RndPlanningDecision(BaseModel):
     project_id: str = Field(default_factory=lambda: "rnd-project-" + uuid4().hex[:16])
     direction: str = Field(min_length=1, max_length=2000)
     value_reason: str = Field(min_length=1, max_length=3000)
+    development_target: RndDevelopmentTarget = RndDevelopmentTarget.MAIDAI_SOURCE
     project_size: RndProjectSize
     single_cycle_feasible: bool
     intended_outcome: RndOutcome = RndOutcome.COMPLETED
@@ -134,6 +143,16 @@ class RndCycle:
         project_id: str = "",
         project_size: RndProjectSize | str | None = None,
         continuation_decision: RndContinuationDecision | str = RndContinuationDecision.NEW,
+        dsh_session_id: str = "",
+        dsh_version: str = "",
+        dsh_profile_version: str = "",
+        dsh_cli_version: str = "",
+        dsh_workspace: str = "",
+        dsh_current_phase: str = "",
+        dsh_phase_progress: dict[str, Any] | None = None,
+        dsh_last_finish_reason: str = "",
+        dsh_last_event_at: str | None = None,
+        baseline_commit: str = "",
     ):
         self.cycle_id = cycle_id
         self.trigger_day = trigger_day
@@ -148,6 +167,16 @@ class RndCycle:
         self.project_id = project_id
         self.project_size = project_size
         self.continuation_decision = continuation_decision
+        self.dsh_session_id = dsh_session_id
+        self.dsh_version = dsh_version
+        self.dsh_profile_version = dsh_profile_version
+        self.dsh_cli_version = dsh_cli_version
+        self.dsh_workspace = dsh_workspace
+        self.dsh_current_phase = dsh_current_phase
+        self.dsh_phase_progress = dict(dsh_phase_progress or {})
+        self.dsh_last_finish_reason = dsh_last_finish_reason
+        self.dsh_last_event_at = dsh_last_event_at
+        self.baseline_commit = baseline_commit
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -164,6 +193,16 @@ class RndCycle:
             "project_id": self.project_id,
             "project_size": self.project_size,
             "continuation_decision": self.continuation_decision,
+            "dsh_session_id": self.dsh_session_id,
+            "dsh_version": self.dsh_version,
+            "dsh_profile_version": self.dsh_profile_version,
+            "dsh_cli_version": self.dsh_cli_version,
+            "dsh_workspace": self.dsh_workspace,
+            "dsh_current_phase": self.dsh_current_phase,
+            "dsh_phase_progress": self.dsh_phase_progress,
+            "dsh_last_finish_reason": self.dsh_last_finish_reason,
+            "dsh_last_event_at": self.dsh_last_event_at,
+            "baseline_commit": self.baseline_commit,
         }
 
 

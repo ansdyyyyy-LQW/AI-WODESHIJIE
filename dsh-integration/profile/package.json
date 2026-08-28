@@ -1,0 +1,16 @@
+{
+  "name": "dsh-profile-maidai",
+  "private": true,
+  "dependencies": {
+    "@maidai/dsh-driver": "file:.."
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@maidai/dsh-driver"
+      ],
+      "patchReload": "startup"
+    }
+  }
+}

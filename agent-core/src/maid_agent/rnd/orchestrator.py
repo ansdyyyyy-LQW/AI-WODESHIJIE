@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from maid_agent.llm.provider import LLMProvider
 from maid_agent.prompts.loader import load_prompt
+from maid_agent.rnd.development_brief import RndDevelopmentBrief
 from maid_agent.rnd.models import (
     RndCheckpointReview, RndCycle, RndPlanningDecision, RndProposal, default_planning_decision,
 )
@@ -122,7 +123,97 @@ class RndOrchestrator:
         _, evidence = self._load_evidence(cycle)
         return await self.plan(cycle, evidence)
 
+    def build_development_brief(
+        self,
+        cycle: RndCycle,
+        planning: RndPlanningDecision,
+        *,
+        token_used: int = 0,
+    ) -> RndDevelopmentBrief:
+        _, evidence = self._load_evidence(cycle)
+        brief = RndDevelopmentBrief.from_planning(
+            cycle_id=cycle.cycle_id,
+            token_budget=cycle.token_budget,
+            planning=planning,
+            evidence=evidence,
+            token_used=token_used,
+        )
+        output = cycle.artifact_dir / "output"
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "rnd_development_brief.json").write_text(
+            brief.model_dump_json(indent=2), encoding="utf-8"
+        )
+        return brief
+
+    @staticmethod
+    def _read_input_json(input_dir: Path, name: str, default: Any) -> Any:
+        path = input_dir / name
+        if not path.is_file():
+            return default
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return default
+
+    def prepare_coding_harness(
+        self,
+        cycle: RndCycle,
+        planning: RndPlanningDecision,
+        workspace: Path,
+        *,
+        baseline_state: dict[str, Any],
+        token_used: int = 0,
+    ) -> tuple[RndDevelopmentBrief, str]:
+        """Materialize the director's brief; no source text or patch is generated here."""
+        brief = self.build_development_brief(cycle, planning, token_used=token_used)
+        input_dir, _ = self._load_evidence(cycle)
+        control = workspace / ".maidai-rnd"
+        brief.write(control)
+        cycle_data = {
+            **cycle.as_dict(),
+            "dsh_session_id": f"maidai-rnd-{cycle.cycle_id}",
+            "baseline_commit": baseline_state.get("baseline_commit", ""),
+            "baseline_source_hash": baseline_state.get("baseline_source_hash", ""),
+            "workspace": str(workspace),
+        }
+        files = {
+            "cycle.json": cycle_data,
+            "budget.json": {
+                "token_budget": brief.token_budget,
+                "token_used": brief.token_used,
+                "remaining_budget": brief.remaining_budget,
+                "phase_budgets": brief.phase_budgets,
+                "checkpoints": [50, 75, 85, 95],
+            },
+            "runtime_evidence.json": self._read_input_json(input_dir, "runtime_evidence.json", {}),
+            "strategy_state.json": self._read_input_json(input_dir, "strategy_state.json", {}),
+            "skill_scoreboard.json": self._read_input_json(input_dir, "skill_scoreboard.json", []),
+            "failed_actions.json": self._read_input_json(input_dir, "failed_actions.json", []),
+            "capability_gaps.json": self._read_input_json(input_dir, "capability_gaps.json", {"items": []}),
+            "previous_project.json": {
+                "previous_project_id": brief.previous_project_id,
+                "continuation_of_project": brief.continuation_of_project,
+                "history": self._read_input_json(input_dir, "rnd_project_history.json", {"items": []}),
+            },
+        }
+        for name, value in files.items():
+            (control / name).write_text(
+                json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+            )
+        constraints = (
+            "# MaidAI R&D constraints\n\n"
+            "- 研发方向和本周期范围已经锁定，不得重新选题或扩大范围。\n"
+            "- 只允许修改当前隔离 workspace；workspace 外写入必须拒绝。\n"
+            "- 不得读取、输出或保存 API Key 与凭据。\n"
+            "- 新 Mod 只进入 handoff，不得安装或重启 Minecraft。\n"
+            "- 同一错误路线快速修正两次仍失败时，改用更简单或已有实现。\n"
+            "- 完成当前阶段后停止；最终 PASS 由 maid-rnd Runner 独立决定。\n"
+        )
+        (control / "constraints.md").write_text(constraints, encoding="utf-8")
+        return brief, load_prompt("rnd_coding_harness")
+
     async def propose(self, cycle: RndCycle, planning: RndPlanningDecision | None = None) -> RndProposal | None:
+        """Legacy bounded patch mode; FULL_HARNESS production does not call this path."""
         input_dir, evidence = self._load_evidence(cycle)
 
         planning = (planning or await self.plan(cycle, evidence)).fit_cycle_budget(cycle.token_budget)

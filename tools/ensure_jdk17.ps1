@@ -6,8 +6,17 @@ $ProgressPreference = "SilentlyContinue"
 
 function Test-Java17([string]$JavaExe) {
     if (-not (Test-Path $JavaExe)) { return $false }
-    $version = & $JavaExe -version 2>&1 | Select-Object -First 1
-    return ($version -match 'version "17\.')
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $JavaExe
+    $startInfo.Arguments = "-version"
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    $version = $process.StandardError.ReadToEnd() + $process.StandardOutput.ReadToEnd()
+    $process.WaitForExit()
+    return ($process.ExitCode -eq 0 -and $version -match 'version "17\.')
 }
 
 $targetPath = [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $Target))

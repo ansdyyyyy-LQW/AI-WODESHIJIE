@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -162,6 +163,144 @@ class HandoffBuilder:
         )
         self.write_checksums(root)
         return root
+
+    def finalize_cycle(self, cycle: RndCycle, summary: dict[str, Any]) -> dict[str, Any]:
+        """Publish the trusted validator result and bounded artifacts into the existing Handoff."""
+        root = cycle.artifact_dir.resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        for directory in (root / "artifacts", root / "validation", root / "output"):
+            directory.mkdir(parents=True, exist_ok=True)
+        outcome = str(getattr(summary.get("outcome"), "value", summary.get("outcome") or "FAILED"))
+        validator = dict(summary.get("final_validator") or {})
+        validator_details = dict(validator.get("details") or {})
+        runner = dict(validator_details.get("runner_result") or {})
+        deepseek = dict(summary.get("deepseek_harness") or {})
+        budget = dict(summary.get("budget") or {})
+        development_dir = root / "development"
+        validation_dir = root / "validation"
+        development_dir.mkdir(parents=True, exist_ok=True)
+        validation_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(development_dir / "brief.json", summary.get("development_brief") or {})
+        _write_json(validation_dir / "final_validation.json", validator)
+
+        def copy_if_file(source: Path, destination: Path) -> None:
+            try:
+                if source.is_file():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, destination)
+            except OSError:
+                return
+
+        copy_if_file(root / "output" / "development" / "dsh_result.json", development_dir / "dsh_result.json")
+        validator_output = root / "output" / "final-validator"
+        copy_if_file(validator_output / "git-diff.patch", validation_dir / "git-diff.patch")
+        if not (validation_dir / "git-diff.patch").is_file():
+            copy_if_file(validator_output / "workspace.diff", validation_dir / "git-diff.patch")
+        copy_if_file(validator_output / "artifact_manifest.json", root / "artifact_manifest.json")
+        workspace_raw = str(validator.get("workspace") or cycle.dsh_workspace or "")
+        if workspace_raw:
+            workspace = Path(workspace_raw)
+            for filename in ("research_result.json", "design_result.json", "final_result.json"):
+                copy_if_file(workspace / ".maidai-rnd" / filename, development_dir / filename)
+        artifacts: list[dict[str, Any]] = []
+
+        def add_artifact(path_value: Any, artifact_type: str) -> None:
+            candidate = Path(str(path_value or ""))
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            try:
+                resolved = candidate.resolve()
+                relative = resolved.relative_to(root).as_posix()
+            except (OSError, ValueError):
+                return
+            if not resolved.is_file():
+                return
+            record = {
+                "type": artifact_type,
+                "path": relative,
+                "size": resolved.stat().st_size,
+                "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+            }
+            if record not in artifacts:
+                artifacts.append(record)
+
+        for item in list(runner.get("artifacts") or []):
+            if isinstance(item, dict):
+                add_artifact(item.get("path"), str(item.get("type") or "build"))
+        for relative, artifact_type in (
+            ("output/rnd_result.json", "result"),
+            ("output/development/dsh_result.json", "dsh_result"),
+            ("output/final-validator/runner_result.json", "validation"),
+            ("output/final-validator/workspace.diff", "source_diff"),
+            ("development/brief.json", "development_brief"),
+            ("development/dsh_result.json", "dsh_result"),
+            ("validation/final_validation.json", "validation"),
+            ("validation/git-diff.patch", "source_diff"),
+            ("artifact_manifest.json", "artifact_manifest"),
+        ):
+            add_artifact(root / relative, artifact_type)
+
+        validation_status = "PASS" if validator.get("ok") is True else "FAIL"
+        manifest = {
+            "cycle_id": cycle.cycle_id,
+            "status": outcome,
+            "mode": "FULL_HARNESS",
+            "requires_user_action": outcome == "WAITING_USER",
+            "summary": str(validator.get("summary") or deepseek.get("summary") or outcome),
+            "production_version": self._production_version(),
+            "source_baseline": cycle.baseline_commit or "",
+            "deepseek_harness": {
+                "version": cycle.dsh_version,
+                "profile_version": cycle.dsh_profile_version,
+                "session_id": cycle.dsh_session_id,
+                "workspace": cycle.dsh_workspace,
+                "current_phase": cycle.dsh_current_phase,
+                "completed_phases": list(deepseek.get("completed_phases") or []),
+            },
+            "token": {
+                "budget": int(budget.get("budget") or cycle.token_budget),
+                "used": int(budget.get("used") or 0),
+                "remaining": int(budget.get("remaining") or 0),
+                "checkpoint": str(budget.get("checkpoint") or ""),
+            },
+            "artifacts": artifacts,
+            "recommendations": [],
+            "validation": {
+                "status": validation_status,
+                "code": str(validator.get("code") or ""),
+                "commands": [
+                    {"name": row.get("name"), "returncode": row.get("returncode")}
+                    for row in list(runner.get("commands") or []) if isinstance(row, dict)
+                ],
+            },
+        }
+        _write_json(root / "handoff_manifest.json", manifest)
+        changed = [str(value) for value in list(runner.get("changed_files") or [])]
+        (root / "RND_REPORT.md").write_text(
+            f"# {cycle.cycle_id} R&D\n\n"
+            f"结果：{outcome}\n\n"
+            f"DeepSeek Harness：{'完成' if deepseek.get('ok') else '未完成'}\n\n"
+            f"Final Validator：{validation_status}\n",
+            encoding="utf-8",
+        )
+        (root / "CHANGE_SUMMARY.md").write_text(
+            "# Change Summary\n\n" + (
+                "\n".join(f"- {path}" for path in changed)
+                if changed else "没有可交付的源码变化。"
+            ) + "\n",
+            encoding="utf-8",
+        )
+        (root / "USER_ACTION_REQUIRED.md").write_text(
+            f"研发完成：{'是' if outcome in {'COMPLETED', 'STAGE_COMPLETED'} else '否'}\n"
+            f"需要人工操作：{'是' if manifest['requires_user_action'] else '否'}\n",
+            encoding="utf-8",
+        )
+        (root / "validation" / "test-results.txt").write_text(
+            json.dumps(manifest["validation"], ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        self.write_checksums(root)
+        return manifest
 
     @staticmethod
     def validate_manifest(path: Path) -> list[str]:

@@ -14,6 +14,8 @@ from maid_agent.llm.openai_compatible import OpenAICompatibleProvider
 from maid_agent.memory.store import MemoryStore
 from maid_agent.metrics.scoreboard import Scoreboard
 from maid_agent.rnd.handoff import HandoffBuilder
+from maid_agent.rnd.api_budget_proxy import RndApiBudgetProxy
+from maid_agent.rnd.dsh_adapter import DeepSeekHarnessAdapter
 from maid_agent.rnd.harness import RndHarness
 from maid_agent.rnd.mod_research.service import ModResearchService
 from maid_agent.rnd.orchestrator import RndOrchestrator
@@ -61,17 +63,33 @@ async def run(settings:AgentSettings)->None:
         with store.connection() as conn:
             row=conn.execute("SELECT cycle_id FROM rnd_cycles WHERE status='RUNNING' LIMIT 1").fetchone()
         return str(row["cycle_id"]) if row else None
-    rnd_provider=None
+    rnd_provider=None; rnd_api_budget_proxy=None
     if settings.rnd_profile:
         key=secret_store.get(settings.rnd_profile.api_key_secret_id)
-        if key:rnd_provider=OpenAICompatibleProvider(settings.rnd_profile,key,ledger,ledger_name="rnd",budget_guard=guard,game_day_getter=lambda:gateway.latest_snapshot.day if gateway.latest_snapshot else None,cycle_id_getter=current_cycle_id,store=store)
+        if key:
+            rnd_provider=OpenAICompatibleProvider(settings.rnd_profile,key,ledger,ledger_name="rnd",budget_guard=guard,game_day_getter=lambda:gateway.latest_snapshot.day if gateway.latest_snapshot else None,cycle_id_getter=current_cycle_id,store=store)
+            rnd_api_budget_proxy=RndApiBudgetProxy(
+                profile=settings.rnd_profile,api_key=key,ledger=ledger,
+                budget_guard=guard,store=store,
+            )
         else:logging.getLogger(__name__).warning("R&D provider configured but its separate API key secret is unavailable")
     project=_project_root();source=settings.source_workspace or project or (settings.data_dir/"source-workspace")
     runner=settings.harness_runner_path
     if not runner and project and (project/"rnd-runner"/"src"/"maid_rnd_runner"/"main.py").exists():runner=str(project/"rnd-runner"/"src"/"maid_rnd_runner"/"main.py")
-    harness=RndHarness(runner_path=runner,source_workspace=source,work_root=settings.harness_work_dir or settings.data_dir/"rnd-worktrees")
-    rnd_service=RndService(store,skills,event_bus,harness,RndOrchestrator(rnd_provider,source),ModResearchService())
-    verifier=PostconditionVerifier();threats=ThreatAnalytics(store);scoreboard=Scoreboard(store);handoff=HandoffBuilder(store,skills,scoreboard,source)
+    local_base=Path(os.environ.get("LOCALAPPDATA",settings.data_dir))/"MaidAI"/"rnd"
+    harness=RndHarness(runner_path=runner,source_workspace=source,work_root=settings.harness_work_dir or local_base/"workspaces")
+    dsh_adapter=DeepSeekHarnessAdapter.discover(
+        project_root=project,dsh_home=local_base/"dsh"/"home",log_root=local_base/"dsh"/"logs",
+        event_handler=lambda event:event_bus.publish("RND_HARNESS",event),
+    )
+    scoreboard=Scoreboard(store);handoff=HandoffBuilder(store,skills,scoreboard,source)
+    rnd_service=RndService(
+        store,skills,event_bus,harness,RndOrchestrator(rnd_provider,source),ModResearchService(),
+        dsh_adapter=dsh_adapter,
+        api_budget_proxy=rnd_api_budget_proxy,
+        handoff_builder=handoff,
+    )
+    verifier=PostconditionVerifier();threats=ThreatAnalytics(store)
     runtime=RuntimeController(gateway=gateway,store=store,token_ledger=ledger,skills=skills,event_bus=event_bus,verifier=verifier,provider=runtime_provider,rnd_trigger=rnd_trigger,handoff_builder=handoff,scoreboard=scoreboard,rnd_service=rnd_service,review_seconds=settings.autonomous_review_seconds,threats=threats)
     stop=asyncio.Event()
     control=ControlApi(settings.host,settings.control_port,settings.control_token,runtime,event_bus,store,skills,ledger,gateway,rnd_trigger,settings,shutdown_event=stop)

@@ -1,0 +1,4 @@
+# MaidAI adds one long-lived JSONL driver over the official DSH core bundle.
+- insert:
+    - id: maidai-driver
+      name: '@maidai/dsh-driver'

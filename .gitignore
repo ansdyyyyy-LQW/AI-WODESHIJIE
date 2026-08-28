@@ -9,13 +9,19 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.test-tmp/
+.test-temp/
+.runtime/
 .venv/
 venv/
 *.egg-info/
+**/node_modules/
+dsh-integration/lib/
 
 # Packaging / runtime
 dist/
 !dist/.gitkeep
+validation/
 *.spec.bak
 *.log
 *.sqlite3

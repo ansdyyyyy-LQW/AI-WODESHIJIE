@@ -4,12 +4,16 @@ import asyncio
 import json
 import logging
 import os
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 from maid_agent.control.events import EventBus
 from maid_agent.memory.store import MemoryStore
+from maid_agent.rnd.api_budget_proxy import RndApiBudgetProxy
+from maid_agent.rnd.dsh_adapter import DeepSeekHarnessAdapter
 from maid_agent.rnd.harness import HarnessResult, RndHarness
+from maid_agent.rnd.handoff import HandoffBuilder
 from maid_agent.rnd.locks import exclusive_file_lock
 from maid_agent.rnd.models import (
     RndCycle, RndMode, RndOutcome, RndPhase, RndPlanningDecision,
@@ -24,12 +28,46 @@ from maid_agent.skills.store import SkillStore
 log = logging.getLogger(__name__)
 ACTIVE_STATUSES = {"CREATED", "RUNNING", "SUSPENDED"}
 TERMINAL_OUTCOMES = {value.value for value in RndOutcome}
+DSH_PHASES = ("RESEARCH", "DESIGN", "DEVELOPMENT", "BUILD_FIX", "FINALIZE")
+DSH_PHASE_TO_RND = {
+    "RESEARCH": RndPhase.RESEARCHING,
+    "DESIGN": RndPhase.DESIGNING,
+    "DEVELOPMENT": RndPhase.DEVELOPING,
+    "BUILD_FIX": RndPhase.FIXING,
+    "FINALIZE": RndPhase.FINALIZING,
+}
+DSH_PHASE_TASKS = {
+    "RESEARCH": (
+        "读取 .maidai-rnd/RND_BRIEF.md 和约束，查看目录、必要源码与依赖，确定可行路线。"
+        "把简短结构化结果写到 .maidai-rnd/research_result.json，必须包含 selected_route、"
+        "affected_components、known_risks、disproved_routes、next_phase_recommendation。此阶段不要扩写长报告。"
+    ),
+    "DESIGN": (
+        "继续核对真实接口、修改边界、文件关系和最短实现顺序。把结构化结果写到 "
+        ".maidai-rnd/design_result.json，然后结束本阶段；不要重新选择 R&D Director 已锁定的方向。"
+    ),
+    "DEVELOPMENT": (
+        "在当前隔离 workspace 内真实修改允许区域的源码。不能只在回复中给 patch、方案或代码片段；"
+        "需要形成可由 git diff 读取的真实文件变化，并做与修改直接相关的最小检查。"
+    ),
+    "BUILD_FIX": (
+        "运行当前改动直接相关的 Python compile、pytest、Gradle 或项目构建，读取真实报错并持续修正。"
+        "同一路线连续失败两次时改用更简单实现或复用成熟实现，不要重复同一个无效修复。"
+    ),
+    "FINALIZE": (
+        "停止扩展范围，检查 git diff，整理源码和产物，并把简短结构化结果写到 "
+        ".maidai-rnd/final_result.json。你不负责宣布最终 PASS；独立 Final Validator 会复验。"
+    ),
+}
 
 
 class RndService:
     def __init__(
         self, store: MemoryStore, skills: SkillStore, event_bus: EventBus, harness: RndHarness,
         orchestrator: RndOrchestrator | None = None, mod_research: ModResearchService | None = None,
+        dsh_adapter: DeepSeekHarnessAdapter | None = None,
+        api_budget_proxy: RndApiBudgetProxy | None = None,
+        handoff_builder: HandoffBuilder | None = None,
     ):
         self.store = store
         self.skills = skills
@@ -37,14 +75,37 @@ class RndService:
         self.harness = harness
         self.orchestrator = orchestrator
         self.mod_research = mod_research or ModResearchService()
+        self.dsh_adapter = dsh_adapter
+        self.api_budget_proxy = api_budget_proxy
+        self.handoff_builder = handoff_builder
 
     def readiness(self) -> dict[str, Any]:
         mode, missing = self.harness.readiness()
-        return {
+        result = {
             "mode": mode, "missing": missing,
             "source_workspace": str(self.harness.source_workspace) if self.harness.source_workspace else None,
             "runner_path": self.harness.runner_path,
         }
+        if self.dsh_adapter is not None:
+            result["deepseek_harness"] = self.dsh_adapter.readiness()
+            result["deepseek_harness"]["api_budget_proxy"] = (
+                self.api_budget_proxy.readiness() if self.api_budget_proxy is not None
+                else {"available": False, "ledger": "rnd"}
+            )
+            if not result["deepseek_harness"]["available"]:
+                result["mode"] = RndMode.ANALYSIS_ONLY
+        return result
+
+    async def check_harness_environment(self) -> dict[str, Any]:
+        if self.dsh_adapter is None:
+            return {"available": False, "startup": False, "missing": ["maidai_dsh_driver"]}
+        ready = self.dsh_adapter.readiness()
+        if not ready.get("available"):
+            return {**ready, "startup": False}
+        if self.dsh_adapter.process is not None and self.dsh_adapter.process.returncode is None:
+            return {**ready, "startup": True, "active_cycle": True}
+        probe_workspace = self.harness.work_root / ".dsh-readiness"
+        return await self.dsh_adapter.probe_startup(probe_workspace)
 
     def recover_interrupted_cycles(self, active_cycle_ids: set[str] | None = None) -> list[RndCycle]:
         """Recover lock-free unfinished rows left by a normal stop or an earlier process."""
@@ -174,10 +235,13 @@ class RndService:
             return await self._run_claimed(cycle)
 
     async def _run_claimed(self, cycle: RndCycle) -> dict[str, Any]:
-        self._update(cycle, status="RUNNING", mode=self.harness.readiness()[0], phase=RndPhase.DECIDING_DIRECTION)
+        entry_phase = cycle.dsh_current_phase or RndPhase.DECIDING_DIRECTION
+        self._update(cycle, status="RUNNING", mode=self.harness.readiness()[0], phase=entry_phase)
         self.event_bus.publish("RND_STATUS", {
-            "cycle_id": cycle.cycle_id, "status": "RUNNING", "phase": RndPhase.DECIDING_DIRECTION,
+            "cycle_id": cycle.cycle_id, "status": "RUNNING", "phase": entry_phase,
         })
+        if self.dsh_adapter is not None:
+            return await self._run_coding_harness_claimed(cycle)
         proposal = None
         planning = None
         attempts: list[dict[str, Any]] = []
@@ -344,6 +408,361 @@ class RndService:
             })
             return summary
 
+    async def _run_coding_harness_claimed(self, cycle: RndCycle) -> dict[str, Any]:
+        """Formal FULL_HARNESS path: director brief -> DSH -> changed workspace."""
+        proposal: RndProposal | None = None
+        planning: RndPlanningDecision | None = None
+        workspace: Path | None = None
+        session_id = cycle.dsh_session_id or f"maidai-rnd-{cycle.cycle_id}"
+        resumed = bool(cycle.dsh_session_id and cycle.dsh_workspace)
+        previous_event_handler: Any = None
+        try:
+            ready = self.dsh_adapter.readiness() if self.dsh_adapter is not None else {"available": False}
+            if not ready.get("available"):
+                planning = (
+                    await self.orchestrator.plan_cycle(cycle)
+                    if self.orchestrator is not None else None
+                )
+                if planning is None:
+                    planning = RndPlanningDecision(
+                        direction="等待 AI 研发环境可用",
+                        value_reason="DeepSeek Harness 未能启动",
+                        project_size=RndProjectSize.SMALL,
+                        single_cycle_feasible=True,
+                        intended_outcome=RndOutcome.WAITING_USER,
+                        current_cycle_scope="保留当前五日输入并等待环境恢复",
+                    ).fit_cycle_budget(cycle.token_budget)
+                proposal = RndProposal(summary="AI研发环境无法启动", planning=planning)
+                return self._close_without_harness(
+                    cycle, proposal, [], "WAITING_USER",
+                    "AI研发环境无法启动：" + ", ".join(ready.get("missing") or []),
+                )
+
+            persisted_proposal = self._load_model(
+                cycle.artifact_dir / "output" / "rnd_proposal.json", RndProposal,
+            )
+            planning = (
+                persisted_proposal.planning if persisted_proposal is not None else self._load_model(
+                    cycle.artifact_dir / "output" / "rnd_budget_plan.json", RndPlanningDecision,
+                )
+            )
+            if planning is None:
+                planning = await self.orchestrator.plan_cycle(cycle) if self.orchestrator else None
+            if planning is None:
+                raise RuntimeError("R&D Director 未能生成研发方向与预算")
+            planning = planning.fit_cycle_budget(cycle.token_budget)
+            self._persist_planning(cycle, planning)
+            proposal = persisted_proposal or RndProposal(
+                summary="方向、范围与预算已由 R&D Director 锁定", planning=planning,
+            )
+            output_root = cycle.artifact_dir / "output"
+            output_root.mkdir(parents=True, exist_ok=True)
+            (output_root / "rnd_proposal.json").write_text(
+                proposal.model_dump_json(indent=2), encoding="utf-8"
+            )
+            if planning.intended_outcome == RndOutcome.WAITING_USER:
+                return self._close_without_harness(
+                    cycle, proposal, [], "WAITING_USER", "独立 R&D API 尚未配置或不可用",
+                )
+
+            state = self.harness.prepare_workspace(cycle, resume=resumed)
+            workspace = Path(state["workspace"])
+            if resumed and Path(cycle.dsh_workspace).resolve() != workspace.resolve():
+                raise RuntimeError("SUSPENDED cycle workspace does not match its persisted DSH workspace")
+            checkpoint = self._checkpoint(cycle)
+            brief, base_task = self.orchestrator.prepare_coding_harness(
+                cycle, planning, workspace, baseline_state=state,
+                token_used=int(checkpoint["used"]),
+            )
+            development = cycle.artifact_dir / "output" / "development"
+            development.mkdir(parents=True, exist_ok=True)
+            (development / "brief.json").write_text(brief.model_dump_json(indent=2), encoding="utf-8")
+            ready = self.dsh_adapter.readiness() if self.dsh_adapter is not None else {}
+            progress = dict(cycle.dsh_phase_progress)
+            completed = [
+                str(item) for item in progress.get("completed", []) if str(item) in DSH_PHASES
+            ]
+            phase_results = [
+                dict(item) for item in progress.get("results", []) if isinstance(item, dict)
+            ]
+            current_phase = (
+                cycle.dsh_current_phase
+                if cycle.dsh_current_phase in DSH_PHASES and cycle.dsh_current_phase not in completed
+                else next((phase for phase in DSH_PHASES if phase not in completed), "FINALIZE")
+            )
+            progress.update({
+                "phase": current_phase, "state": "running", "resumed": resumed,
+                "completed": completed, "results": phase_results,
+            })
+            self._update(
+                cycle, status="RUNNING", phase=DSH_PHASE_TO_RND[current_phase], workspace=workspace,
+                dsh_session_id=session_id, dsh_version=str(ready.get("version") or ""),
+                dsh_profile_version=str(ready.get("profile_version") or ""),
+                dsh_cli_version=str(ready.get("cli_version") or ""),
+                dsh_workspace=str(workspace), dsh_current_phase=current_phase,
+                dsh_phase_progress=progress,
+                baseline_commit=str(state.get("baseline_commit") or cycle.baseline_commit),
+                touch_dsh_event=True,
+            )
+            assert self.dsh_adapter is not None
+            if self.api_budget_proxy is not None:
+                model_environment = await self.api_budget_proxy.start(
+                    cycle_id=cycle.cycle_id, phase=current_phase,
+                )
+                self.dsh_adapter.set_model_environment(model_environment)
+            elif isinstance(self.dsh_adapter, DeepSeekHarnessAdapter):
+                raise RuntimeError("R&D API 预算代理不可用，已阻止 DSH 绕过 rnd TokenLedger")
+
+            active_phase = current_phase
+            if hasattr(self.dsh_adapter, "event_handler"):
+                previous_event_handler = self.dsh_adapter.event_handler
+
+                def persist_event(event: dict[str, Any]) -> None:
+                    if callable(previous_event_handler):
+                        previous_event_handler(event)
+                    event_progress = dict(cycle.dsh_phase_progress)
+                    event_progress.update({
+                        "phase": active_phase,
+                        "state": str(event.get("status") or event.get("event") or "active"),
+                        "session_ready": bool(event.get("session_id")),
+                    })
+                    self._update(
+                        cycle, status="RUNNING", dsh_phase_progress=event_progress,
+                        dsh_current_phase=active_phase, touch_dsh_event=True,
+                    )
+
+                self.dsh_adapter.event_handler = persist_event
+
+            checkpoint_reviews = list(checkpoint.get("reviews") or [])
+            driver_attached = False
+            force_closed = False
+            all_ok = True
+            last_code = "SUCCESS"
+            last_summary = "所有 DSH 阶段已完成"
+            total_usage: dict[str, int] = {}
+            for phase_name in DSH_PHASES:
+                if phase_name in completed:
+                    continue
+                checkpoint, checkpoint_reviews, stop_reason = await self._apply_due_checkpoints(
+                    cycle, proposal, checkpoint_reviews,
+                )
+                if checkpoint["force_close"] and phase_name != "FINALIZE":
+                    force_closed = True
+                    continue
+                if stop_reason and not checkpoint["force_close"]:
+                    all_ok = False
+                    last_code = "CHECKPOINT_STOP"
+                    last_summary = stop_reason
+                    break
+
+                active_phase = phase_name
+                current_phase = phase_name
+                progress.update({
+                    "phase": phase_name, "state": "running", "completed": completed,
+                    "results": phase_results,
+                })
+                self._update(
+                    cycle, status="RUNNING", phase=DSH_PHASE_TO_RND[phase_name],
+                    dsh_current_phase=phase_name, dsh_phase_progress=progress,
+                    touch_dsh_event=True,
+                )
+                self.event_bus.publish("RND_STATUS", {
+                    "cycle_id": cycle.cycle_id, "status": "RUNNING",
+                    "phase": DSH_PHASE_TO_RND[phase_name], "dsh_phase": phase_name,
+                })
+                if self.api_budget_proxy is not None:
+                    self.api_budget_proxy.set_phase(phase_name)
+                restriction = ""
+                if checkpoint["finish_only"]:
+                    restriction = (
+                        "\n预算已到 85% 收尾区：不得新增大型范围或继续扩展，只能完成现有实现、"
+                        "修复、编译、验证和整理。"
+                    )
+                phase_task = (
+                    (base_task + "\n\n" if not resumed and not driver_attached else "")
+                    + f"当前阶段：{phase_name}。"
+                    + ("这是同一 cycle、同一 session、同一 workspace 的恢复；不要重新选方向。" if resumed and not driver_attached else "")
+                    + DSH_PHASE_TASKS[phase_name]
+                    + f"\n当前锁定范围：{proposal.planning.current_cycle_scope}"
+                    + restriction
+                )
+                if not driver_attached:
+                    command = self.dsh_adapter.resume if resumed else self.dsh_adapter.start_cycle
+                else:
+                    command = self.dsh_adapter.run_phase
+                dsh = await command(
+                    session_id=session_id, workspace=workspace,
+                    task=phase_task, phase=phase_name,
+                )
+                driver_attached = True
+                phase_result = {
+                    "phase": phase_name, "ok": dsh.ok, "code": dsh.code,
+                    "finish_reason": dsh.finish_reason, "summary": dsh.summary,
+                    "usage": dsh.usage,
+                }
+                phase_results.append(phase_result)
+                for key, value in dsh.usage.items():
+                    total_usage[key] = total_usage.get(key, 0) + int(value)
+                (development / f"dsh_{phase_name.lower()}.json").write_text(
+                    json.dumps({**phase_result, "events": dsh.events}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                last_code = dsh.code
+                last_summary = dsh.summary
+                if dsh.ok:
+                    completed.append(phase_name)
+                progress.update({
+                    "state": "finished" if dsh.ok else "failed",
+                    "finish_reason": dsh.finish_reason, "session_ready": True,
+                    "completed": completed, "results": phase_results,
+                })
+                self._update(
+                    cycle, status="RUNNING", dsh_session_id=session_id,
+                    dsh_workspace=str(workspace), dsh_current_phase=phase_name,
+                    dsh_phase_progress=progress, dsh_last_finish_reason=dsh.finish_reason,
+                    touch_dsh_event=True,
+                )
+                if not dsh.ok:
+                    all_ok = False
+                    break
+                checkpoint, checkpoint_reviews, stop_reason = await self._apply_due_checkpoints(
+                    cycle, proposal, checkpoint_reviews,
+                )
+                if checkpoint["force_close"]:
+                    force_closed = True
+                elif stop_reason:
+                    all_ok = False
+                    last_code = "CHECKPOINT_STOP"
+                    last_summary = stop_reason
+                    break
+
+            progress.update({
+                "state": "completed" if all_ok else "failed", "completed": completed,
+                "results": phase_results, "force_closed": force_closed,
+            })
+            self._update(
+                cycle, status="RUNNING", dsh_phase_progress=progress,
+                dsh_current_phase=current_phase,
+                dsh_last_finish_reason="completed" if all_ok else cycle.dsh_last_finish_reason,
+                touch_dsh_event=True,
+            )
+            (development / "dsh_result.json").write_text(json.dumps({
+                "ok": all_ok, "code": last_code, "summary": last_summary,
+                "session_id": session_id, "workspace": str(workspace),
+                "completed_phases": completed, "phase_results": phase_results,
+                "usage": total_usage, "force_closed": force_closed,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            checkpoint = self._checkpoint(cycle)
+            validator = await self.harness.validate_workspace(
+                cycle, baseline_commit=str(state.get("baseline_commit") or cycle.baseline_commit),
+            )
+            validator_attempt = {
+                "phase": "FINAL_VALIDATOR", "ok": validator.ok, "code": validator.code,
+                "summary": validator.summary,
+            }
+            decision_result = validator
+            if not all_ok and validator.ok:
+                decision_result = HarnessResult(
+                    False, RndMode.FULL_HARNESS, last_code, last_summary,
+                    workspace, development,
+                    {"session_id": session_id, "completed_phases": completed},
+                )
+            if not all_ok or not validator.ok:
+                outcome = RndOutcome.FAILED
+            elif force_closed or planning.intended_outcome == RndOutcome.STAGE_COMPLETED:
+                outcome = RndOutcome.STAGE_COMPLETED
+            else:
+                outcome = RndOutcome.COMPLETED
+            project_state = self._project_state(
+                cycle, proposal, result=decision_result,
+                attempts=[*phase_results, validator_attempt],
+                checkpoint=checkpoint,
+            )
+            failure_state = self._failure_state(
+                cycle, proposal, result=decision_result,
+                attempts=[*phase_results, validator_attempt],
+                checkpoint=checkpoint,
+            ) if outcome == RndOutcome.FAILED else {}
+            summary = {
+                "outcome": outcome,
+                "phase": RndPhase.FINALIZING,
+                "budget": checkpoint,
+                "development_brief": brief.model_dump(mode="json"),
+                "deepseek_harness": {
+                    "ok": all_ok, "code": last_code, "summary": last_summary,
+                    "session_id": session_id, "usage": total_usage,
+                    "completed_phases": completed, "phase_results": phase_results,
+                    "force_closed": force_closed,
+                },
+                "final_validator": {
+                    "ok": validator.ok, "code": validator.code,
+                    "summary": validator.summary, "workspace": str(validator.workspace or ""),
+                    "output_dir": str(validator.output_dir), "details": validator.details,
+                },
+                "checkpoint_reviews": checkpoint_reviews,
+                "proposal": proposal.model_dump(mode="json"),
+                "project_state": project_state,
+                "failure_state": failure_state,
+            }
+            self._write_result(cycle, summary)
+            if self.handoff_builder is not None:
+                self.handoff_builder.finalize_cycle(cycle, summary)
+            self._update(
+                cycle, status=outcome.value, outcome=outcome, phase=RndPhase.FINALIZING,
+                mode=RndMode.FULL_HARNESS, summary=json.dumps(summary, ensure_ascii=False, default=str),
+                workspace=workspace, checkpoint=checkpoint, project_state=project_state,
+                failure_state=failure_state,
+            )
+            self.event_bus.publish("RND_STATUS", {
+                "cycle_id": cycle.cycle_id, "status": outcome.value,
+                "phase": RndPhase.FINALIZING, "result": summary,
+            })
+            return summary
+        except asyncio.CancelledError:
+            if self.dsh_adapter is not None:
+                with suppress(Exception):
+                    suspended = await asyncio.wait_for(
+                        asyncio.shield(self.dsh_adapter.suspend()), timeout=30,
+                    )
+                    if suspended is not None:
+                        self._update(
+                            cycle, status="RUNNING", dsh_last_finish_reason="suspended",
+                            dsh_phase_progress={**cycle.dsh_phase_progress, "state": "suspended"},
+                            touch_dsh_event=True,
+                        )
+            self.finalize_cancelled(
+                cycle, "R&D task 已安全暂停；DSH session 与 workspace 已保留", proposal,
+            )
+            raise
+        except Exception as exc:
+            log.exception("DSH R&D cycle failed")
+            checkpoint = self._checkpoint(cycle)
+            summary = {
+                "ok": False, "outcome": RndOutcome.FAILED,
+                "code": "DSH_CYCLE_FAILED", "error": str(exc), "budget": checkpoint,
+                "session_id": session_id, "workspace": str(workspace or ""),
+            }
+            self._write_result(cycle, summary)
+            if self.handoff_builder is not None:
+                with suppress(Exception):
+                    self.handoff_builder.finalize_cycle(cycle, summary)
+            self._update(
+                cycle, status="FAILED", outcome=RndOutcome.FAILED,
+                phase=RndPhase.FINALIZING,
+                summary=json.dumps(summary, ensure_ascii=False, default=str),
+                workspace=workspace, checkpoint=checkpoint,
+            )
+            return summary
+        finally:
+            if self.dsh_adapter is not None and hasattr(self.dsh_adapter, "event_handler"):
+                self.dsh_adapter.event_handler = previous_event_handler
+            if self.dsh_adapter is not None:
+                with suppress(Exception):
+                    await self.dsh_adapter.terminate()
+            if self.api_budget_proxy is not None:
+                with suppress(Exception):
+                    await self.api_budget_proxy.close()
+
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:
         try:
@@ -409,6 +828,10 @@ class RndService:
 
     @staticmethod
     def _cycle_from_row(row: Any) -> RndCycle:
+        try:
+            dsh_phase_progress = json.loads(row["dsh_phase_progress_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            dsh_phase_progress = {}
         return RndCycle(
             str(row["cycle_id"]), int(row["trigger_day"]),
             int(row["runtime_period_start_day"]), int(row["runtime_period_end_day"]),
@@ -417,6 +840,16 @@ class RndService:
             outcome=row["outcome"], project_id=str(row["project_id"] or ""),
             project_size=row["project_size"],
             continuation_decision=str(row["continuation_decision"] or "NEW"),
+            dsh_session_id=str(row["dsh_session_id"] or ""),
+            dsh_version=str(row["dsh_version"] or ""),
+            dsh_profile_version=str(row["dsh_profile_version"] or ""),
+            dsh_cli_version=str(row["dsh_cli_version"] or ""),
+            dsh_workspace=str(row["dsh_workspace"] or ""),
+            dsh_current_phase=str(row["dsh_current_phase"] or ""),
+            dsh_phase_progress=dsh_phase_progress,
+            dsh_last_finish_reason=str(row["dsh_last_finish_reason"] or ""),
+            dsh_last_event_at=row["dsh_last_event_at"],
+            baseline_commit=str(row["baseline_commit"] or ""),
         )
 
     @staticmethod
@@ -450,7 +883,8 @@ class RndService:
         root = Path(work_root) / cycle.cycle_id
         if not root.exists():
             return []
-        return [str(path) for path in sorted(root.glob("attempt-*/source")) if path.exists()]
+        paths = [root / "source", *sorted(root.glob("attempt-*/source"))]
+        return [str(path) for path in paths if path.exists()]
 
     @staticmethod
     def _recoverable_input(cycle: RndCycle) -> bool:
@@ -840,6 +1274,12 @@ class RndService:
         project_state: dict[str, Any] | None = None, failure_state: dict[str, Any] | None = None,
         project_id: str | None = None, project_size: Any | None = None,
         continuation_decision: Any | None = None, clear_outcome: bool = False,
+        dsh_session_id: str | None = None, dsh_version: str | None = None,
+        dsh_profile_version: str | None = None, dsh_cli_version: str | None = None,
+        dsh_workspace: str | None = None, dsh_current_phase: str | None = None,
+        dsh_phase_progress: dict[str, Any] | None = None,
+        dsh_last_finish_reason: str | None = None, baseline_commit: str | None = None,
+        touch_dsh_event: bool = False,
     ) -> None:
         values = {
             "status": status,
@@ -855,6 +1295,15 @@ class RndService:
             "project_id": project_id,
             "project_size": str(getattr(project_size, "value", project_size)) if project_size is not None else None,
             "continuation_decision": str(getattr(continuation_decision, "value", continuation_decision)) if continuation_decision is not None else None,
+            "dsh_session_id": dsh_session_id,
+            "dsh_version": dsh_version,
+            "dsh_profile_version": dsh_profile_version,
+            "dsh_cli_version": dsh_cli_version,
+            "dsh_workspace": dsh_workspace,
+            "dsh_current_phase": dsh_current_phase,
+            "dsh_phase_progress_json": json.dumps(dsh_phase_progress, ensure_ascii=False, default=str) if dsh_phase_progress is not None else None,
+            "dsh_last_finish_reason": dsh_last_finish_reason,
+            "baseline_commit": baseline_commit,
         }
         assignments = ["status=?", "updated_at=CURRENT_TIMESTAMP"]
         args: list[Any] = [status]
@@ -862,6 +1311,8 @@ class RndService:
             assignments.extend(["owner_pid=NULL", "owner_started_at=NULL"])
         if clear_outcome:
             assignments.append("outcome=NULL")
+        if touch_dsh_event:
+            assignments.append("dsh_last_event_at=CURRENT_TIMESTAMP")
         for key, value in values.items():
             if key == "status" or value is None:
                 continue
@@ -877,3 +1328,12 @@ class RndService:
             cycle.outcome = outcome
         elif clear_outcome:
             cycle.outcome = None
+        for name, value in (
+            ("dsh_session_id", dsh_session_id), ("dsh_version", dsh_version),
+            ("dsh_profile_version", dsh_profile_version), ("dsh_cli_version", dsh_cli_version),
+            ("dsh_workspace", dsh_workspace), ("dsh_current_phase", dsh_current_phase),
+            ("dsh_phase_progress", dsh_phase_progress),
+            ("dsh_last_finish_reason", dsh_last_finish_reason), ("baseline_commit", baseline_commit),
+        ):
+            if value is not None:
+                setattr(cycle, name, value)

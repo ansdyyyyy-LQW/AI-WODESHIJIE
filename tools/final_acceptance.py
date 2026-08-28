@@ -68,6 +68,7 @@ def inspect_windows_package(path: Path | None) -> dict:
     if path.is_dir():
         exe = path / "Maid AI Control.exe"
         bridge = list(path.glob("MaidAI-Bridge-*.jar")) + list(path.glob("MaidAI-Bridge.jar"))
+        dsh_root = path / "_internal" / "dsh"
         errors = []
         if not exe.is_file():
             errors.append("missing Maid AI Control.exe")
@@ -75,6 +76,14 @@ def inspect_windows_package(path: Path | None) -> dict:
             errors.append("missing Bridge JAR")
         if not (path / "README_CN.txt").is_file():
             errors.append("missing README_CN.txt")
+        for required in (
+            dsh_root / "node" / "node.exe",
+            dsh_root / "maidai-profile" / "lib" / "launcher.js",
+            dsh_root / "maidai-profile" / "references" / "DEEPSEEK_HARNESS_LOCK.json",
+            dsh_root / "maidai-profile" / "node_modules" / "@deepseek-ai" / "dsh" / "package.json",
+        ):
+            if not required.is_file():
+                errors.append(f"missing bundled DSH file: {required.relative_to(path)}")
         return {"status": "PASS" if not errors else "FAIL", "path": str(path), "errors": errors}
     errors = []
     try:
@@ -83,6 +92,12 @@ def inspect_windows_package(path: Path | None) -> dict:
             if not any(name.endswith("/Maid AI Control.exe") for name in names):errors.append("missing Maid AI Control.exe")
             if not any(name.endswith(("/MaidAI-Bridge.jar",)) or ("/MaidAI-Bridge-" in name and name.endswith(".jar")) for name in names):errors.append("missing Bridge JAR")
             if not any(name.endswith("/README_CN.txt") for name in names):errors.append("missing README_CN.txt")
+            for suffix in (
+                "/_internal/dsh/node/node.exe",
+                "/_internal/dsh/maidai-profile/lib/launcher.js",
+                "/_internal/dsh/maidai-profile/references/DEEPSEEK_HARNESS_LOCK.json",
+            ):
+                if not any(name.endswith(suffix) for name in names):errors.append(f"missing bundled DSH file: {suffix}")
     except zipfile.BadZipFile:errors.append("invalid Windows package ZIP")
     return {"status":"PASS" if not errors else "FAIL","path":str(path),"sha256":sha256(path),"size":path.stat().st_size,"errors":errors}
 
@@ -108,6 +123,8 @@ def main() -> None:
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
     commands = []
     if not args.skip_tests:
+        test_temp = ROOT / ".test-temp" / "release"
+        test_temp.parent.mkdir(parents=True, exist_ok=True)
         commands.append(run_command(
             "python_tests",
             [
@@ -119,7 +136,7 @@ def main() -> None:
                 "control-center/tests",
                 "rnd-runner/tests",
                 "--basetemp",
-                str(ROOT / ".test-temp" / "release"),
+                str(test_temp),
             ],
             env,
         ))

@@ -129,8 +129,24 @@ class SettingsPage(Page):
         self.rnd_same = QCheckBox("使用与日常 AI 相同的配置")
         self.rnd_same.toggled.connect(self.toggle_rnd_same)
         self.rnd = ProviderEditor("独立研发接口", "rnd", config)
+        self.source_workspace = QLineEdit()
+        self.source_workspace.setPlaceholderText("选择当前完整 MaidAI 源码文件夹")
+        self.harness_status = QLabel("尚未检查")
+        self.harness_status.setWordWrap(True)
+        self.harness_version = QLabel("—")
+        check_harness = QPushButton("检查研发环境")
+        check_harness.clicked.connect(
+            lambda: self.api.command("CHECK_RND_HARNESS") if self.api else None
+        )
         rnd_layout.addWidget(self.rnd_same)
         rnd_layout.addWidget(self.rnd)
+        harness_form = QFormLayout()
+        harness_form.addRow("DeepSeek Harness", QLabel("启用"))
+        harness_form.addRow("研发源码文件夹", self.source_workspace)
+        harness_form.addRow("Harness 状态", self.harness_status)
+        harness_form.addRow("Harness 版本", self.harness_version)
+        harness_form.addRow(check_harness)
+        rnd_layout.addLayout(harness_form)
         layout.addWidget(rnd_box)
 
         rules = QGroupBox("研发周期和使用限制")
@@ -153,7 +169,6 @@ class SettingsPage(Page):
         self.host = QLineEdit()
         self.bridge_port = QSpinBox(); self.bridge_port.setRange(1024, 65535)
         self.control_port = QSpinBox(); self.control_port.setRange(1024, 65535)
-        self.source_workspace = QLineEdit()
         self.harness_path = QLineEdit()
         self.review_seconds = QSpinBox(); self.review_seconds.setRange(15, 3600)
         self.api_timeout = QSpinBox(); self.api_timeout.setRange(5, 1800)
@@ -165,7 +180,6 @@ class SettingsPage(Page):
         advanced_form.addRow("本机地址", self.host)
         advanced_form.addRow("游戏连接端口", self.bridge_port)
         advanced_form.addRow("界面连接端口", self.control_port)
-        advanced_form.addRow("研发源码目录", self.source_workspace)
         advanced_form.addRow("本地研发程序", self.harness_path)
         advanced_form.addRow("AI 请求超时（秒）", self.api_timeout)
         advanced_form.addRow("重新判断间隔（秒）", self.review_seconds)
@@ -215,6 +229,7 @@ class SettingsPage(Page):
         self.refresh_minecraft()
         if self.api:
             self.api.command("GET_DIAGNOSTICS")
+            self.api.command("GET_RND")
 
     def browse(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "选择 Minecraft 文件夹", self.game_dir.text())
@@ -275,6 +290,20 @@ class SettingsPage(Page):
 
     def update_diagnostics(self, data: dict) -> None:
         self.diagnostics.setPlainText(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+
+    def update_harness_readiness(self, data: dict) -> None:
+        readiness = dict(data.get("readiness") or {})
+        harness = dict(readiness.get("deepseek_harness") or readiness)
+        self.harness_version.setText(str(harness.get("version") or "—"))
+        if harness.get("startup") is True:
+            text, color = "启动检查通过", "#15803d"
+        elif harness.get("available") is True:
+            text, color = "环境文件可用", "#15803d"
+        else:
+            missing = "、".join(str(value) for value in harness.get("missing") or [])
+            text, color = ("不可用" + (f"：{missing}" if missing else "")), "#b91c1c"
+        self.harness_status.setText(text)
+        self.harness_status.setStyleSheet(f"color:{color}")
 
     def save(self) -> None:
         try:

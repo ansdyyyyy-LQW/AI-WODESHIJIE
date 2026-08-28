@@ -1,0 +1,28 @@
+# Production is confined to the cycle workspace and never prompts for writes
+# that stay inside that boundary. Outside writes remain rejected by the sandbox.
+- id: sandbox-policy
+  config:
+    mode: workspace-write
+    workspaceRoot: !!js process.cwd()
+
+- id: approval
+  config:
+    policy: never
+
+- id: permission
+  config:
+    presets:
+      maidai-workspace:
+        sandbox: workspace-write
+        approval: never
+        name: MaidAI workspace
+        description: Write only inside the isolated R&D workspace without interactive prompts.
+    defaultPreset: maidai-workspace
+
+- id: system-prompt
+  config:
+    persona: >-
+      You are the MaidAI R&D coding agent powered by {{model}}. Work only in
+      {{cwd}}. Read the MaidAI R&D brief and constraints, inspect the real
+      source, edit files in the workspace, run the relevant build and tests,
+      repair direct failures, and stop when the assigned phase is complete.

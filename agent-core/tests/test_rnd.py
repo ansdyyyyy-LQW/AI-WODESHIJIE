@@ -47,6 +47,60 @@ def test_every_fifth_day_is_idempotent_and_builds_handoff(tmp_path) -> None:
     assert builder.validate_manifest(root / "handoff_manifest.json") == []
 
 
+def test_final_handoff_and_cycle_list_expose_dsh_validator_and_artifacts(tmp_path) -> None:
+    store = MemoryStore(tmp_path / "state.sqlite3")
+    trigger = RndTrigger(store, tmp_path / "handoff", cycle_days=5, budget=100_000)
+    cycle = trigger.create(5)
+    cycle.dsh_version = "0.1.1-rc.2"
+    cycle.dsh_profile_version = "maidai-dsh-profile-v1"
+    cycle.dsh_session_id = "session-resumable"
+    cycle.dsh_workspace = str(tmp_path / "workspace")
+    cycle.dsh_current_phase = "FINALIZE"
+    cycle.baseline_commit = "abc123"
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE rnd_cycles SET dsh_version=?,dsh_profile_version=?,dsh_session_id=?,"
+            "dsh_workspace=?,dsh_current_phase=?,baseline_commit=?,dsh_phase_progress_json=? WHERE cycle_id=?",
+            (
+                cycle.dsh_version, cycle.dsh_profile_version, cycle.dsh_session_id,
+                cycle.dsh_workspace, cycle.dsh_current_phase, cycle.baseline_commit,
+                json.dumps({"completed": ["RESEARCH", "DESIGN"]}), cycle.cycle_id,
+            ),
+        )
+    output = cycle.artifact_dir / "output"
+    validator = output / "final-validator"
+    artifact = validator / "artifacts" / "cycle-001-modified-source.zip"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"verified source")
+    (output / "development").mkdir(parents=True)
+    (output / "development" / "dsh_result.json").write_text("{}", encoding="utf-8")
+    runner = {
+        "ok": True,
+        "changed_files": ["calc.py"],
+        "commands": [{"name": "pytest", "returncode": 0}],
+        "artifacts": [{"type": "source", "path": str(artifact)}],
+    }
+    (validator / "runner_result.json").write_text(json.dumps(runner), encoding="utf-8")
+    summary = {
+        "outcome": "COMPLETED",
+        "budget": {"budget": 100_000, "used": 30_000, "remaining": 70_000, "checkpoint": "30%"},
+        "deepseek_harness": {"ok": True, "summary": "done", "completed_phases": ["RESEARCH", "DESIGN", "DEVELOPMENT", "BUILD_FIX", "FINALIZE"]},
+        "final_validator": {"ok": True, "code": "SUCCESS", "summary": "validated", "details": {"runner_result": runner}},
+    }
+    (output / "rnd_result.json").write_text(json.dumps(summary), encoding="utf-8")
+    builder = HandoffBuilder(store, SkillStore(store), Scoreboard(), tmp_path)
+    manifest = builder.finalize_cycle(cycle, summary)
+
+    assert manifest["validation"]["status"] == "PASS"
+    assert manifest["deepseek_harness"]["session_id"] == "session-resumable"
+    assert manifest["artifacts"][0]["sha256"]
+    assert builder.validate_manifest(cycle.artifact_dir / "handoff_manifest.json") == []
+    listed = trigger.list_cycles()[0]
+    assert listed["final_validator"]["ok"] is True
+    assert listed["artifact_count"] >= 1
+    assert listed["dsh_phase_progress"]["completed"] == ["RESEARCH", "DESIGN"]
+
+
 def test_cycle_creation_is_atomic_and_never_reuses_an_active_cycle(tmp_path) -> None:
     store = MemoryStore(tmp_path / "state.sqlite3")
     trigger = RndTrigger(store, tmp_path / "handoff", cycle_days=5, token_budget=100_000_000)

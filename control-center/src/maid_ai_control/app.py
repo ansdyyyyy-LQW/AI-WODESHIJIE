@@ -47,6 +47,8 @@ EVENT_TEXT = {
     "BRIDGE_STATUS": "Minecraft 连接状态已更新",
     "RND_STATUS": "AI 研发有了新进展",
     "RND_CYCLE_CREATED": "新的研发周期已经开始",
+    "RND_HARNESS": "研发环境有了新进展",
+    "RND_BUDGET": "研发用量已更新",
     "BRIDGE_EVENT": "Minecraft 世界发生了变化",
     "THREAT_CHANGED": "附近危险情况发生了变化",
     "DECISION": "AI 作出了新的决定",
@@ -243,6 +245,10 @@ class MainWindow(QMainWindow):
             self.token_rnd_page.update_tokens(data)
         elif command == "GET_RND":
             self.token_rnd_page.update_rnd(data)
+            self.settings_page.update_harness_readiness(data)
+        elif command == "CHECK_RND_HARNESS":
+            self.settings_page.update_harness_readiness(data)
+            self.api.command("GET_RND")
         elif command == "RESEARCH_MODS":
             self.token_rnd_page.update_research(data)
         elif command == "MARK_RND_HANDLED":
@@ -275,8 +281,10 @@ class MainWindow(QMainWindow):
     def _route_event(self, event: str, payload: dict) -> None:
         if event in {"RUNTIME_STATUS", "GOAL_STATUS", "PLAN_STATUS", "CURRENT_ACTION", "BRIDGE_STATUS", "DECISION"}:
             self.api.command("GET_STATUS")
-        elif event in {"RND_STATUS", "RND_CYCLE_CREATED"}:
+        elif event in {"RND_STATUS", "RND_CYCLE_CREATED", "RND_HARNESS", "RND_BUDGET"}:
             self.api.command("GET_RND")
+            if event == "RND_BUDGET":
+                self.api.command("GET_TOKENS")
         elif event in {"BRIDGE_EVENT", "THREAT_CHANGED"}:
             self.api.command("GET_THREAT")
         detail = visible_text(payload.get("summary") or payload.get("decision_summary") or "")
