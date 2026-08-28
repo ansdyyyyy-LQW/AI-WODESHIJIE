@@ -1,0 +1,15 @@
+MaidAI 0.3.0 完整源码说明
+
+完整源码包包含当前实际修改后的生产工作树。
+
+已包含：
+- agent-core
+- maid-ai-bridge
+- control-center
+- rnd-runner
+- tools
+- Windows 构建/打包脚本
+- 中文启动说明与实机验收清单
+
+正式 Windows 成品与源码包分开发布；成品包内包含 Maid AI Control.exe 和 MaidAI-Bridge.jar。
+自动构建和测试不替代 Minecraft 真实世界验收；未进入游戏实测时状态必须保持 NOT_RUN。

@@ -1,0 +1,91 @@
+name: Maid AI Windows Package
+
+on:
+  push:
+    branches: [feature/maid-ai-project]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-windows:
+    if: ${{ !contains(github.event.head_commit.message || '', 'materialize Maid AI project source') || true }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stop before source bootstrap
+        id: guard
+        shell: pwsh
+        run: |
+          if (Test-Path ".maid-ai-upload") {
+            "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - uses: actions/setup-java@v4
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          gradle-version: '8.8'
+
+      - name: Build Forge Bridge
+        if: steps.guard.outputs.skip != 'true'
+        working-directory: maid-ai-project/maid-ai-bridge
+        run: gradle --no-daemon clean build --stacktrace
+
+      - uses: actions/setup-python@v5
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            maid-ai-project/agent-core/pyproject.toml
+            maid-ai-project/control-center/pyproject.toml
+            maid-ai-project/rnd-runner/pyproject.toml
+
+      - name: Install and test
+        if: steps.guard.outputs.skip != 'true'
+        working-directory: maid-ai-project
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e 'agent-core[test]' -e 'control-center[test,package]' -e 'rnd-runner[test]'
+          $env:QT_QPA_PLATFORM='offscreen'
+          $env:PYTHONPATH='agent-core/src;control-center/src;rnd-runner/src'
+          python -m pytest -q agent-core/tests control-center/tests rnd-runner/tests
+
+      - name: Build Maid AI Control.exe
+        if: steps.guard.outputs.skip != 'true'
+        working-directory: maid-ai-project
+        run: python tools/package_windows.py
+
+      - name: Packaged EXE self-test
+        if: steps.guard.outputs.skip != 'true'
+        working-directory: maid-ai-project
+        shell: pwsh
+        run: '& ".\dist\MaidAI\Maid AI Control.exe" --self-test'
+
+      - name: Final package acceptance
+        if: steps.guard.outputs.skip != 'true'
+        working-directory: maid-ai-project
+        env:
+          PYTHONPATH: agent-core/src;control-center/src;rnd-runner/src
+        run: python tools/final_acceptance.py --bridge-jar maid-ai-bridge/build/libs/MaidAI-Bridge-0.1.0.jar --windows-package dist/MaidAI --skip-tests
+
+      - name: Upload Windows release ZIP
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MaidAI-Windows-0.1.0-Release
+          compression-level: 0
+          path: |
+            maid-ai-project/dist/MaidAI-Windows-0.1.0.zip
+            maid-ai-project/validation/*

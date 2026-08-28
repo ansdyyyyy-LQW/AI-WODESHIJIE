@@ -1,0 +1,37 @@
+# Java / Gradle
+.gradle/
+**/build/
+**/run/
+**/out/
+*.class
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Packaging / runtime
+dist/
+!dist/.gitkeep
+*.spec.bak
+*.log
+*.sqlite3
+*.db
+.env
+config.local.toml
+
+# R&D worktrees and user data
+.rnd-worktrees/
+handoff/rnd-input/
+handoff/cycle-*/
+!handoff/.gitkeep
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db

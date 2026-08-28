@@ -1,0 +1,3 @@
+package com.maidaibridge.action.impl;
+import com.maidaibridge.action.AbstractMaidAction;import com.maidaibridge.action.ActionContext;import net.minecraft.world.item.Item;import net.minecraft.world.item.ItemStack;
+public final class UseItemAction extends AbstractMaidAction {private final Item item;public UseItemAction(String req,int timeout,Item item){super(req,"use_item",timeout);this.item=item;}@Override protected void onTick(ActionContext ctx){ItemStack stack=ctx.inventory().extract(ctx.maid(),item,1,false);if(stack.isEmpty()){fail("NO_MATERIAL");return;}ItemStack result=stack.finishUsingItem(ctx.level(),ctx.maid());if(!result.isEmpty()&&!ctx.inventory().insert(ctx.maid(),result))ctx.maid().spawnAtLocation(result);succeed("ITEM_USED");}}

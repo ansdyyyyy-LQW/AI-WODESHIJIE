@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "locked_at": "2026-08-27",
+  "policy": "Reference source only. Do not vendor or copy incompatible Fabric, Mineflayer or different-Minecraft-version production code. Verify license again before any future code reuse.",
+  "references": [
+    {
+      "name": "Touhou Little Maid",
+      "url": "https://github.com/TartaricAcid/TouhouLittleMaid.git",
+      "branch": "1.20",
+      "commit": "8a3ac5e9eacf0c6d63adf8832949f3ce81484fe6",
+      "license": "MIT code; CC BY-NC-SA 4.0 selected assets as declared upstream",
+      "purpose": "EntityMaid, ILittleMaid, IMaidTask and real inventory/navigation/world interaction API"
+    },
+    {
+      "name": "Maid Intelligence",
+      "url": "https://github.com/RhineIris/touhou-little-maid-maidintelligence.git",
+      "branch": "main",
+      "commit": "a2fea9aa6f7079afa37ee608eddb32d1a99a35c3",
+      "license": "MIT",
+      "purpose": "TLM addon integration, path execution, incremental scan and mining lifecycle reference"
+    },
+    {
+      "name": "mc_aiplayer",
+      "url": "https://github.com/zoyluoblue/mc_aiplayer.git",
+      "branch": "main",
+      "commit": "295204a23982d81bff5813c7cd0ff6605e2c5b4f",
+      "license": "MIT",
+      "purpose": "Typed Goal, deterministic Task and postcondition architecture"
+    },
+    {
+      "name": "Minecraft-Agent",
+      "url": "https://github.com/Kevin-Liu-01/Minecraft-Agent.git",
+      "branch": "main",
+      "commit": "6e4d52af1e03cf6c2c9a7d697f06fb5a66650558",
+      "license": "MIT",
+      "purpose": "External agent loop, Plan checkpoint, Memory, Skill and recovery reference"
+    },
+    {
+      "name": "Minecraft Agent Swarm",
+      "url": "https://github.com/JesseRWeigel/minecraft-agent-swarm.git",
+      "branch": "main",
+      "commit": "3e41b073fdfc5206b08a26f90b141a692311104f",
+      "license": "MIT",
+      "purpose": "Skill success statistics, versioning and refinement queue"
+    },
+    {
+      "name": "Mindcraft",
+      "url": "https://github.com/mindcraft-bots/mindcraft.git",
+      "branch": "main",
+      "commit": "5f3acc87b479864124173de444f31fa5538f94a6",
+      "license": "MIT",
+      "purpose": "Provider routing, runtime/code model separation and context management"
+    },
+    {
+      "name": "qxfMCAI",
+      "url": "https://github.com/QXF19/qxfMCAI.git",
+      "branch": "main",
+      "commit": "58238fe857d128a9cb1b9539574a46b976e8e7b3",
+      "license": "MIT",
+      "purpose": "Forge 1.20.1 entity execution, request and Chinese diagnostics reference"
+    },
+    {
+      "name": "mc-agents",
+      "url": "https://github.com/jblemee/mc-agents.git",
+      "branch": "main",
+      "commit": "309e05079f4f8eea1352e7e72afd2e2adc261316",
+      "license": "No LICENSE file found at locked commit; reference-only, no code copied",
+      "purpose": "Strategy/reflex/memory layering concept only"
+    },
+    {
+      "name": "Voyager",
+      "url": "https://github.com/MineDojo/Voyager.git",
+      "branch": "main",
+      "commit": "55e45a880755d0c8c66ca7fb5fe7962ac8974f89",
+      "license": "MIT",
+      "purpose": "Curriculum and reusable skill library research"
+    },
+    {
+      "name": "Odyssey",
+      "url": "https://github.com/zju-vipa/Odyssey.git",
+      "branch": "main",
+      "commit": "260303c8c0c5afd86d8b50edffb5ffac0de01d4f",
+      "license": "Verify upstream before reuse; reference-only in v0.1.0",
+      "purpose": "Atomic/composite skill and long-horizon planning research"
+    },
+    {
+      "name": "Minecraft Agentic Builder",
+      "url": "https://github.com/NoblerWorks-HQ/minecraft-agentic.git",
+      "branch": "main",
+      "commit": "8d6c1e09f67002cfeae7fbb66d0956fc9c78ebcc",
+      "license": "Verify upstream before reuse; reference-only in v0.1.0",
+      "purpose": "Building DSL and high-level blueprint primitives"
+    },
+    {
+      "name": "Minecraft Multimodal Agent",
+      "url": "https://github.com/win10ogod/mc-multimodal-agent.git",
+      "branch": "main",
+      "commit": "8d1b9dc62d5a9e99aa2b33fd50fe19ee2b920f0e",
+      "license": "Verify upstream before reuse; reference-only in v0.1.0",
+      "purpose": "Future multimodal observation, goal tree and litematic research"
+    }
+  ]
+}

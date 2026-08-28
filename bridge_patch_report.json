@@ -1,0 +1,30 @@
+{
+  "created": [
+    "com/maidaibridge/action/MaidRequestReplayCache.java",
+    "com/maidaibridge/action/MaidActionSafety.java",
+    "com/maidaibridge/controller/MaidBridgeEventPublisher.java",
+    "com/maidaibridge/controller/MaidAiForgeEvents.java"
+  ],
+  "modified": [
+    "com/maidaibridge/action/impl/UseBlockAction.java",
+    "com/maidaibridge/action/impl/TransferContainerAction.java",
+    "com/maidaibridge/action/impl/SmeltAction.java",
+    "com/maidaibridge/action/impl/BreakBlockAction.java",
+    "com/maidaibridge/action/impl/PlaceBlockAction.java",
+    "com/maidaibridge/action/impl/UseBlockAction.java",
+    "com/maidaibridge/action/impl/CraftAction.java",
+    "com/maidaibridge/action/impl/SmeltAction.java",
+    "com/maidaibridge/controller/MaidAiController.java"
+  ],
+  "warnings": [
+    "ActionEngine future method not found",
+    "UseBlockAction: BlockPos local not found",
+    "TransferContainerAction: BlockPos local not found",
+    "SmeltAction: BlockPos local not found",
+    "BreakBlockAction: BlockPos local not found",
+    "PlaceBlockAction: BlockPos local not found",
+    "UseBlockAction still contains setBlock",
+    "CraftAction recipe loop not found",
+    "snapshot-producing observation method not found"
+  ]
+}

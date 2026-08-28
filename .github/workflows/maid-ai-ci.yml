@@ -1,0 +1,111 @@
+name: Maid AI Linux CI
+
+on:
+  push:
+    branches: [feature/maid-ai-project]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bootstrap uploaded source archive
+        id: bootstrap
+        shell: bash
+        run: |
+          if [ -d .maid-ai-upload ] && ls .maid-ai-upload/chunk-* >/dev/null 2>&1; then
+            cat .maid-ai-upload/chunk-* | base64 --decode > /tmp/maid-ai-project.tar.xz
+            tar -xJf /tmp/maid-ai-project.tar.xz
+            rm -rf .maid-ai-upload
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A maid-ai-project .maid-ai-upload || true
+            git commit -m "feat: materialize Maid AI project source" || true
+            git push origin HEAD:${GITHUB_REF_NAME}
+            echo "did_bootstrap=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "did_bootstrap=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Java 17
+        if: steps.bootstrap.outputs.did_bootstrap != 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        if: steps.bootstrap.outputs.did_bootstrap != 'true'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.8'
+
+      - name: Build Forge Bridge
+        if: steps.bootstrap.outputs.did_bootstrap != 'true'
+        working-directory: maid-ai-project/maid-ai-bridge
+        run: gradle --no-daemon clean build --stacktrace
+
+      - name: Set up Python 3.12
+        if: steps.bootstrap.outputs.did_bootstrap != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            maid-ai-project/agent-core/pyproject.toml
+            maid-ai-project/control-center/pyproject.toml
+            maid-ai-project/rnd-runner/pyproject.toml
+
+      - name: Install Linux Qt runtime libraries
+        if: steps.bootstrap.outputs.did_bootstrap != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libopengl0 libxkbcommon-x11-0 libxcb-cursor0
+
+      - name: Install Python modules
+        if: steps.bootstrap.outputs.did_bootstrap != 'true'
+        working-directory: maid-ai-project
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e 'agent-core[test]' -e 'control-center[test]' -e 'rnd-runner[test]'
+
+      - name: Run Python and offscreen UI tests
+        if: steps.bootstrap.outputs.did_bootstrap != 'true'
+        working-directory: maid-ai-project
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONPATH: agent-core/src:control-center/src:rnd-runner/src
+        shell: bash
+        run: |
+          mkdir -p validation
+          set +e
+          python -m pytest -vv agent-core/tests control-center/tests rnd-runner/tests --junitxml=validation/pytest-linux.xml 2>&1 | tee validation/pytest-linux.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Final automated acceptance
+        if: steps.bootstrap.outputs.did_bootstrap != 'true'
+        working-directory: maid-ai-project
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONPATH: agent-core/src:control-center/src:rnd-runner/src
+        run: python tools/final_acceptance.py --bridge-jar maid-ai-bridge/build/libs/MaidAI-Bridge-0.1.0.jar --skip-tests
+
+      - name: Upload Linux validation artifacts
+        if: ${{ always() && steps.bootstrap.outputs.did_bootstrap != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: MaidAI-Linux-Validation
+          path: |
+            maid-ai-project/maid-ai-bridge/build/libs/MaidAI-Bridge-*.jar
+            maid-ai-project/validation/*

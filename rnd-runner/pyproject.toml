@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "maid-rnd-runner"
+version = "0.3.0"
+description = "Isolated source-modifying and build-validating R&D runner for Maid AI"
+requires-python = ">=3.11,<3.14"
+dependencies = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+maid-rnd = "maid_rnd_runner.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/maid_rnd_runner"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
