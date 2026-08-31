@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import shlex
 import shutil
 import subprocess
 import threading
@@ -22,15 +24,26 @@ from maid_agent.rnd.trigger import RndTrigger
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def _pwsh_calc_check(calc_file: Path) -> str:
-    quoted = str(calc_file).replace("'", "''")
-    return (
-        "$ErrorActionPreference = 'Stop'; "
-        f"$source = Get-Content -Raw -LiteralPath '{quoted}'; "
-        "if (-not $source.Contains('return a + b;')) { "
-        "throw 'calc acceptance failed' }; "
-        "Write-Output 'calc acceptance passed'"
-    )
+def _platform_calc_check(calc_file: Path) -> str:
+    if os.name == "nt":
+        quoted = str(calc_file).replace("'", "''")
+        return (
+            "$ErrorActionPreference = 'Stop'; "
+            f"$source = Get-Content -Raw -LiteralPath '{quoted}'; "
+            "if (-not $source.Contains('return a + b;')) { "
+            "throw 'calc acceptance failed' }; "
+            "Write-Output 'calc acceptance passed'"
+        )
+    return f"grep -Fq 'return a + b;' {shlex.quote(str(calc_file))}"
+
+
+def _platform_git_diff(workspace: Path) -> str:
+    marker = "docs/dsh_workspace_isolation_acceptance.md"
+    if os.name == "nt":
+        quoted = str(workspace).replace("'", "''")
+        return f"git -C '{quoted}' add -N -- {marker}; git -C '{quoted}' diff -- {marker}"
+    quoted = shlex.quote(str(workspace))
+    return f"git -C {quoted} add -N -- {marker} && git -C {quoted} diff -- {marker}"
 
 
 def _text(value: Any) -> str:
@@ -83,6 +96,7 @@ async def test_official_dsh_edits_runs_failed_test_then_fixes_and_keeps_producti
         pytest.skip("build dsh-integration before running the integration acceptance")
     node = shutil.which("node")
     assert node is not None, "Node runtime is required for the real DSH integration acceptance"
+    shell_tool = "pwsh" if os.name == "nt" else "bash"
     requests: list[dict[str, Any]] = []
     emitted_tools: list[str] = []
     active = {"mode": "calc_fail"}
@@ -115,8 +129,8 @@ async def test_official_dsh_edits_runs_failed_test_then_fixes_and_keeps_producti
                             "file_path": str(outside_target),
                             "content": "this write must be rejected\n",
                         }),
-                        _tool("calc-fail", "pwsh", {
-                            "command": _pwsh_calc_check(calc / "calc.js"),
+                        _tool("calc-fail", shell_tool, {
+                            "command": _platform_calc_check(calc / "calc.js"),
                             "description": "Run failing calculation test",
                             "workdir": ".",
                         }),
@@ -130,8 +144,8 @@ async def test_official_dsh_edits_runs_failed_test_then_fixes_and_keeps_producti
                             "old_string": "  return a - b;\n",
                             "new_string": "  return a + b;\n",
                         }),
-                        _tool("calc-pass", "pwsh", {
-                            "command": _pwsh_calc_check(calc / "calc.js"),
+                        _tool("calc-pass", shell_tool, {
+                            "command": _platform_calc_check(calc / "calc.js"),
                             "description": "Run repaired calculation test",
                             "workdir": ".",
                         }),
@@ -143,13 +157,8 @@ async def test_official_dsh_edits_runs_failed_test_then_fixes_and_keeps_producti
                             "file_path": "docs/dsh_workspace_isolation_acceptance.md",
                             "content": "DSH isolated workspace acceptance\n",
                         }),
-                        _tool("maidai-diff", "pwsh", {
-                            "command": (
-                                f"git -C '{str(workspace).replace(chr(39), chr(39) * 2)}' add -N -- "
-                                "docs/dsh_workspace_isolation_acceptance.md; "
-                                f"git -C '{str(workspace).replace(chr(39), chr(39) * 2)}' diff -- "
-                                "docs/dsh_workspace_isolation_acceptance.md"
-                            ),
+                        _tool("maidai-diff", shell_tool, {
+                            "command": _platform_git_diff(workspace),
                             "description": "Show isolated workspace source diff",
                             "workdir": ".",
                         }),
@@ -226,7 +235,7 @@ async def test_official_dsh_edits_runs_failed_test_then_fixes_and_keeps_producti
         assert calc_result.finish_reason == "tool_failed"
         assert calc_result.raw["tool_state"]["ok"] is False
         assert {row["tool"] for row in calc_result.raw["tool_state"]["unresolved_failures"]} >= {
-            "write", "pwsh",
+            "write", shell_tool,
         }
         assert not outside_target.exists()
         active["mode"] = "calc_fix"
@@ -288,7 +297,9 @@ async def test_official_dsh_edits_runs_failed_test_then_fixes_and_keeps_producti
         assert call_counts["calc_fail"] >= 3
         assert call_counts["calc_fix"] >= 4
         assert call_counts["maidai"] >= 3
-        assert emitted_tools == ["read", "write", "pwsh", "read", "edit", "pwsh", "write", "pwsh"]
+        assert emitted_tools == [
+            "read", "write", shell_tool, "read", "edit", shell_tool, "write", shell_tool,
+        ]
     finally:
         for value in reversed(adapters):
             await value.terminate()
