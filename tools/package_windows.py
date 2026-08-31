@@ -21,6 +21,57 @@ SOURCE_EXCLUDED = {
 }
 
 
+def check_deepseek_harness_lock(*, require_installed: bool = False) -> None:
+    lock = json.loads(DSH_LOCK.read_text(encoding="utf-8"))
+    project_package_path = ROOT / "dsh-integration" / "package.json"
+    project_package = json.loads(project_package_path.read_text(encoding="utf-8"))
+
+    node = shutil.which("node.exe") or shutil.which("node")
+    pnpm = shutil.which("pnpm.cmd") or shutil.which("pnpm")
+    if not node or not pnpm:
+        raise SystemExit("Node or pnpm is unavailable; cannot verify the DeepSeek Harness lock")
+
+    node_version = subprocess.check_output(
+        [node, "--version"], text=True, encoding="utf-8"
+    ).strip().lstrip("v")
+    pnpm_version = subprocess.check_output(
+        [pnpm, "--version"], text=True, encoding="utf-8"
+    ).strip()
+    expected_pnpm = str(project_package.get("packageManager") or "")
+    project_dsh = str((project_package.get("dependencies") or {}).get("@deepseek-ai/dsh") or "")
+    project_version = str(project_package.get("version") or "")
+
+    mismatches: list[str] = []
+    if node_version != str(lock.get("node_version") or ""):
+        mismatches.append(f"Node expected {lock.get('node_version')}, got {node_version}")
+    if f"pnpm@{pnpm_version}" != expected_pnpm:
+        mismatches.append(f"pnpm expected {expected_pnpm}, got pnpm@{pnpm_version}")
+    if project_dsh != str(lock.get("version") or ""):
+        mismatches.append(f"DSH expected {lock.get('version')}, got {project_dsh}")
+    if project_version != str(lock.get("profile_version") or ""):
+        mismatches.append(f"Profile expected {lock.get('profile_version')}, got {project_version}")
+    if project_version != str(lock.get("driver_version") or ""):
+        mismatches.append(f"Driver expected {lock.get('driver_version')}, got {project_version}")
+
+    if require_installed:
+        installed_path = (
+            ROOT / "dsh-integration" / "node_modules" / "@deepseek-ai" / "dsh" / "package.json"
+        )
+        if not installed_path.is_file():
+            mismatches.append("Installed DSH package is missing")
+        else:
+            installed_package = json.loads(installed_path.read_text(encoding="utf-8"))
+            installed_version = str(installed_package.get("version") or "")
+            if installed_version != str(lock.get("version") or ""):
+                mismatches.append(
+                    f"Installed DSH expected {lock.get('version')}, got {installed_version}"
+                )
+
+    if mismatches:
+        raise SystemExit("DeepSeek Harness lock mismatch: " + "; ".join(mismatches))
+    print("DSH_LOCK_OK")
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -79,6 +130,8 @@ def bundle_deepseek_harness(destination: Path) -> dict[str, str]:
     node_dir.mkdir(parents=True)
     shutil.copy2(node, node_dir / "node.exe")
     source = ROOT / "dsh-integration"
+    if not (source / "lib" / "launcher.js").is_file():
+        raise SystemExit("DeepSeek Harness integration is not built: dsh-integration/lib/launcher.js is missing")
     profile.mkdir(parents=True)
     for directory in ("lib", "profile"):
         shutil.copytree(source / directory, profile / directory)
@@ -157,6 +210,7 @@ def write_source_zip() -> Path:
 def main() -> None:
     if os.name != "nt":
         raise SystemExit("Windows product packaging must run on Windows because PyInstaller cannot cross-build a real .exe")
+    check_deepseek_harness_lock(require_installed=True)
     bridge_candidates = sorted((ROOT / "maid-ai-bridge" / "build" / "libs").glob("MaidAI-Bridge-*.jar"))
     if not bridge_candidates:
         raise SystemExit("Bridge JAR not found; build the Forge Bridge first")
@@ -223,5 +277,9 @@ def main() -> None:
 if __name__ == "__main__":
     if sys.argv[1:] == ["--source-only"]:
         print(write_source_zip())
+    elif sys.argv[1:] == ["--check-dsh-lock"]:
+        check_deepseek_harness_lock()
+    elif sys.argv[1:] == ["--check-dsh-lock", "--require-installed"]:
+        check_deepseek_harness_lock(require_installed=True)
     else:
         main()

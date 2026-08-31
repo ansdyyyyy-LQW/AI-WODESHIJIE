@@ -119,10 +119,16 @@ class RndApiBudgetProxy:
         self._server: _ProxyHttpServer | None = None
         self._thread: threading.Thread | None = None
         self._request_lock = threading.Lock()
+        self._web_research_compatible: bool | None = None
 
     def readiness(self) -> dict[str, Any]:
+        search_url = self._search_upstream_url()
         return {
             "available": bool(self.profile and self._api_key),
+            "web_research": bool(
+                self.profile and self._api_key and search_url
+                and self._web_research_compatible is not False
+            ),
             "host": "127.0.0.1",
             "running": self._server is not None,
             "cycle_id": self.cycle_id or None,
@@ -191,7 +197,7 @@ class RndApiBudgetProxy:
             self._send_json(handler, 401, "RND_PROXY_UNAUTHORIZED", "研发代理令牌无效")
             return
         path = urlsplit(handler.path).path.rstrip("/")
-        if path not in {"/chat/completions", "/v1/chat/completions"}:
+        if path not in {"/chat/completions", "/v1/chat/completions", "/messages"}:
             self._send_json(
                 handler, 400, "RND_PROXY_ROUTE_BLOCKED",
                 "该 DSH 辅助模型路由未接入研发 Token 账本，已阻止调用",
@@ -213,7 +219,156 @@ class RndApiBudgetProxy:
             self._send_json(handler, 400, "RND_PROXY_INVALID_BODY", "研发模型请求必须是 JSON 对象")
             return
         with self._request_lock:
-            self._proxy_chat(handler, payload)
+            if path == "/messages":
+                self._proxy_search(handler, payload)
+            else:
+                self._proxy_chat(handler, payload)
+
+    def _search_upstream_url(self) -> str:
+        """Map the configured provider origin to DeepSeek's locked Anthropic search route."""
+        parsed = urlsplit(self.profile.base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return ""
+        path = parsed.path.rstrip("/")
+        if path.endswith("/anthropic/v1"):
+            search_base = path
+        elif path.endswith("/v1"):
+            search_base = path[:-3] + "/anthropic/v1"
+        else:
+            search_base = path + "/anthropic/v1"
+        return f"{parsed.scheme}://{parsed.netloc}{search_base}/messages"
+
+    def _proxy_search(self, handler: _ProxyHandler, payload: dict[str, Any]) -> None:
+        """Forward the one DSH web-search route without exposing the provider key."""
+        request_id = "dsh-search-" + uuid4().hex
+        started = time.monotonic()
+        purpose = "rnd_research"
+        prompt_estimate = estimate_tokens(
+            list(payload.get("messages") or []), list(payload.get("tools") or []) or None,
+        )
+        desired = payload.get("max_tokens")
+        if not isinstance(desired, int) or isinstance(desired, bool) or desired < 1:
+            desired = self.budget_guard.rnd_settings.max_single_request
+        try:
+            _, completion_cap = self.budget_guard.limit_rnd_request(
+                cycle_id=self.cycle_id,
+                prompt_tokens=prompt_estimate,
+                purpose=purpose,
+                desired_completion_tokens=min(
+                    desired, self.budget_guard.rnd_settings.max_single_request,
+                ),
+            )
+        except BudgetExceeded as exc:
+            self._record_search_request(
+                request_id=request_id, purpose=purpose, started=started, http_status=400,
+                ok=False, prompt_tokens=0, completion_tokens=0, total_tokens=0,
+                estimated=False, error_code=exc.code,
+            )
+            self._send_json(handler, 400, exc.code, str(exc))
+            return
+
+        url = self._search_upstream_url()
+        if not url:
+            self._record_search_request(
+                request_id=request_id, purpose=purpose, started=started, http_status=None,
+                ok=False, prompt_tokens=0, completion_tokens=0, total_tokens=0,
+                estimated=False, error_code="RND_SEARCH_BACKEND_UNAVAILABLE",
+            )
+            self._send_json(
+                handler, 503, "RND_SEARCH_BACKEND_UNAVAILABLE", "研发网页搜索上游未正确配置",
+            )
+            return
+
+        upstream_payload = dict(payload)
+        upstream_payload["max_tokens"] = completion_cap
+        headers = {
+            "x-api-key": self._api_key,
+            "Authorization": f"Bearer {self._api_key}",
+            "anthropic-version": handler.headers.get("anthropic-version", "2023-06-01"),
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            **self.profile.extra_headers,
+        }
+        try:
+            timeout = httpx.Timeout(self.profile.timeout_seconds)
+            with httpx.Client(timeout=timeout, transport=self.transport) as client:
+                response = client.post(url, headers=headers, json=upstream_payload)
+            body = response.content
+            if response.status_code < 400:
+                self._web_research_compatible = True
+            elif response.status_code in {404, 405, 501}:
+                self._web_research_compatible = False
+            usage_payload: dict[str, Any] | None = None
+            if response.status_code < 400:
+                try:
+                    decoded = response.json()
+                except json.JSONDecodeError:
+                    decoded = None
+                if isinstance(decoded, dict) and isinstance(decoded.get("usage"), dict):
+                    usage_payload = decoded["usage"]
+                if usage_payload is not None and any(
+                    key in usage_payload for key in (
+                        "prompt_tokens", "input_tokens", "completion_tokens",
+                        "output_tokens", "total_tokens",
+                    )
+                ):
+                    usage = TokenUsage.from_provider(usage_payload)
+                    self.ledger.record(
+                        ledger="rnd", purpose=purpose, model=self.profile.model,
+                        request_id=request_id, usage=usage, cycle_id=self.cycle_id,
+                    )
+                    recorded = usage
+                else:
+                    recorded = TokenUsage(0, 0, 0, False)
+                self._record_search_request(
+                    request_id=request_id, purpose=purpose, started=started,
+                    http_status=response.status_code, ok=True,
+                    prompt_tokens=recorded.prompt_tokens,
+                    completion_tokens=recorded.completion_tokens,
+                    total_tokens=recorded.total_tokens, estimated=recorded.estimated,
+                    error_code="",
+                )
+            else:
+                self._record_search_request(
+                    request_id=request_id, purpose=purpose, started=started,
+                    http_status=response.status_code, ok=False,
+                    prompt_tokens=0, completion_tokens=0, total_tokens=0,
+                    estimated=False, error_code=f"HTTP_{response.status_code}",
+                )
+            handler.send_response(response.status_code)
+            handler.send_header("content-type", response.headers.get("content-type", "application/json"))
+            handler.send_header("content-length", str(len(body)))
+            handler.send_header("connection", "close")
+            handler.end_headers()
+            handler.wfile.write(body)
+        except (httpx.HTTPError, OSError) as exc:
+            self._web_research_compatible = False
+            self._record_search_request(
+                request_id=request_id, purpose=purpose, started=started,
+                http_status=None, ok=False, prompt_tokens=0, completion_tokens=0,
+                total_tokens=0, estimated=False, error_code=exc.__class__.__name__,
+            )
+            self._send_json(handler, 502, "RND_PROXY_UPSTREAM_FAILED", "研发网页搜索上游请求失败")
+
+    def _record_search_request(self, **values: Any) -> None:
+        self._record_request(**values)
+        latency_ms = int((time.monotonic() - float(values["started"])) * 1000)
+        self.store.record_event(
+            game_day=0,
+            game_tick=0,
+            event_type="RND_WEB_RESEARCH",
+            severity="INFO" if values.get("ok") else "WARNING",
+            payload={
+                "request_id": values.get("request_id"),
+                "cycle_id": self.cycle_id,
+                "phase": self.phase,
+                "ok": bool(values.get("ok")),
+                "http_status": values.get("http_status"),
+                "latency_ms": latency_ms,
+                "error_code": values.get("error_code") or "",
+            },
+            source="rnd",
+        )
 
     def _proxy_chat(self, handler: _ProxyHandler, payload: dict[str, Any]) -> None:
         request_id = "dsh-proxy-" + uuid4().hex

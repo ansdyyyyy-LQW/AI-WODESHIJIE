@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,13 @@ async def test_agent_core_calls_final_validator_on_existing_workspace(tmp_path: 
     )
     state = harness.prepare_workspace(cycle)
     workspace = Path(state["workspace"])
+    control = workspace / ".maidai-rnd"
+    control.mkdir()
+    (control / "brief.json").write_text(json.dumps({
+        "project_id": "maidai-source-test",
+        "development_target": "MAIDAI_SOURCE",
+        "allowed_areas": ["agent-core/"],
+    }), encoding="utf-8")
     (workspace / "agent-core" / "src" / "demo" / "__init__.py").write_text(
         "VALUE = 2\n", encoding="utf-8",
     )
@@ -56,4 +64,6 @@ async def test_agent_core_calls_final_validator_on_existing_workspace(tmp_path: 
     assert result.ok is True and result.code == "SUCCESS"
     runner_result = result.details["runner_result"]
     assert runner_result["validator_decision"] == "PASS"
-    assert runner_result["changed_files"] == ["agent-core/src/demo/__init__.py"]
+    assert runner_result["changed_files"] == [
+        ".maidai-rnd/brief.json", "agent-core/src/demo/__init__.py",
+    ]

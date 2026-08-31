@@ -66,6 +66,21 @@ def test_03_four_pages_plain_text_and_button_routes(tmp_path:Path,monkeypatch):
     assert "0.1.1-rc.2" in token.rnd_cards["harness"].value.text()
     assert token.rnd_cards["validator"].value.text()=="通过"
     assert token.artifact_state.text()=="2 个已登记文件"
+    token.update_rnd({
+        "readiness":{"deepseek_harness":{"available":True,"version":"0.1.1-rc.2","api_budget_proxy":{"available":True}}},
+        "cycles":[{
+            "cycle_id":"cycle-002","status":"COMPLETED","outcome":"COMPLETED",
+            "artifact_dir":str(tmp_path/"forge-handoff"),"artifact_count":3,
+            "final_validator":{"ok":True},
+            "artifacts":[{"type":"forge_mod","name":"Example Mod","mod_id":"examplemod","sha256":"hidden"}],
+        }],
+    })
+    assert token.result_name.text()=="新 Mod"
+    assert token.result_state.text()=="研发成功"
+    assert token.user_action.text()=="需要安装并重启 Minecraft"
+    assert token.artifact_state.text()=="1 个 Forge Mod"
+    assert token.open_folder_button.isEnabled() and token.readme_button.isEnabled()
+    assert "examplemod" not in token.result_name.text() and "hidden" not in token.result_name.text()
     window.settings_page.update_harness_readiness({"readiness":{"deepseek_harness":{"available":True,"startup":True,"version":"0.1.1-rc.2"}}})
     assert window.settings_page.harness_status.text()=="启动检查通过"
     assert window.settings_page.harness_version.text()=="0.1.1-rc.2"

@@ -6,15 +6,23 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tomllib
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 IGNORE = {".git", ".gradle", ".venv", ".runtime", "build", "dist", "__pycache__", ".pytest_cache", "logs", "run", "data", "node_modules"}
+
+
+class ValidationFailure(RuntimeError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass
@@ -43,6 +51,7 @@ class HarnessRunner:
         self.commands: list[CommandResult] = []
         self.baseline_commit = baseline_commit.strip()
         self.changed_files: list[str] = []
+        self.brief: dict[str, Any] = {}
 
     def run(self) -> int:
         result: dict[str, Any] = {
@@ -57,6 +66,7 @@ class HarnessRunner:
         try:
             if not self.source.is_dir():
                 raise RuntimeError("isolated source workspace is missing")
+            self.brief = self._load_brief()
             diff = self._workspace_diff()
             result.update(diff)
             manifest = self._manifest()
@@ -65,6 +75,7 @@ class HarnessRunner:
             )
             if not diff["workspace_changed"]:
                 raise RuntimeError("DSH workspace contains no change after the Git baseline")
+            self._validate_changed_areas()
             if self._implementation_change_required() and not any(
                 not path.startswith(".maidai-rnd/") for path in self.changed_files
             ):
@@ -72,8 +83,11 @@ class HarnessRunner:
             self._run_standard_verification()
             for command in self._load_extra_commands():
                 self._run_command("requested", command, self.source)
+            forge_artifacts: list[dict[str, Any]] = []
+            if str(self.brief.get("development_target")) == "NEW_FORGE_ADDON":
+                forge_artifacts = self._build_and_validate_forge_addon()
             failed = [row for row in self.commands if row.returncode != 0]
-            self._collect_artifacts(result)
+            self._collect_artifacts(result, forge_artifacts)
             (self.output / "artifact_manifest.json").write_text(
                 json.dumps({"cycle_id": self.cycle_id, "artifacts": result["artifacts"]}, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -84,12 +98,73 @@ class HarnessRunner:
             result["validator_decision"] = "PASS" if not failed else "FAIL"
         except Exception as exc:
             result["error"] = f"{exc.__class__.__name__}: {exc}"
+            if isinstance(exc, ValidationFailure):
+                result["error_code"] = exc.code
             result["commands"] = [asdict(row) for row in self.commands]
             result["validator_decision"] = "FAIL"
         (self.output / "runner_result.json").write_text(
             json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         return 0 if result.get("ok") else 1
+
+    def _load_brief(self) -> dict[str, Any]:
+        path = self.source / ".maidai-rnd" / "brief.json"
+        if not path.is_file():
+            raise ValidationFailure("RND_BRIEF_MISSING", "source/.maidai-rnd/brief.json is missing")
+        try:
+            brief = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValidationFailure("RND_BRIEF_INVALID", "brief.json is not valid JSON") from exc
+        if not isinstance(brief, dict):
+            raise ValidationFailure("RND_BRIEF_INVALID", "brief.json must contain an object")
+        project_id = str(brief.get("project_id") or "")
+        if not re.fullmatch(r"[a-zA-Z0-9._-]+", project_id):
+            raise ValidationFailure("RND_INVALID_PROJECT_ID", "brief project_id is not a safe filename")
+        if not isinstance(brief.get("allowed_areas"), list) or not brief["allowed_areas"]:
+            raise ValidationFailure("RND_BRIEF_INVALID", "brief allowed_areas is missing")
+        return brief
+
+    @staticmethod
+    def _normalize_relative_path(value: str, *, keep_trailing: bool = False) -> str:
+        raw = str(value).replace("\\", "/")
+        trailing = keep_trailing and raw.endswith("/")
+        if raw.startswith("/") or re.match(r"^[a-zA-Z]:", raw):
+            raise ValidationFailure("RND_CHANGE_OUTSIDE_ALLOWED_AREAS", "absolute paths are forbidden")
+        parts: list[str] = []
+        for part in raw.split("/"):
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                raise ValidationFailure("RND_CHANGE_OUTSIDE_ALLOWED_AREAS", "path traversal is forbidden")
+            parts.append(part)
+        normalized = "/".join(parts)
+        if not normalized:
+            raise ValidationFailure("RND_CHANGE_OUTSIDE_ALLOWED_AREAS", "empty paths are forbidden")
+        return normalized + ("/" if trailing else "")
+
+    def _validate_changed_areas(self) -> None:
+        project_id = str(self.brief["project_id"])
+        allowed: list[str] = [".maidai-rnd/"]
+        for raw in self.brief["allowed_areas"]:
+            expanded = str(raw).replace("<project-id>", project_id)
+            allowed.append(self._normalize_relative_path(expanded, keep_trailing=True))
+        outside: list[str] = []
+        normalized_changes: list[str] = []
+        for raw in self.changed_files:
+            path = self._normalize_relative_path(raw)
+            normalized_changes.append(path)
+            if not any(
+                path.startswith(area) if area.endswith("/") else path == area
+                for area in allowed
+            ):
+                outside.append(path)
+        self.changed_files = sorted(set(normalized_changes))
+        if outside:
+            shown = ", ".join(sorted(set(outside))[:10])
+            raise ValidationFailure(
+                "RND_CHANGE_OUTSIDE_ALLOWED_AREAS",
+                f"changed files are outside brief.allowed_areas: {shown}",
+            )
 
     def _workspace_diff(self) -> dict[str, Any]:
         if not (self.source / ".git").is_dir():
@@ -148,14 +223,7 @@ class HarnessRunner:
         }
 
     def _implementation_change_required(self) -> bool:
-        brief_path = self.source / ".maidai-rnd" / "brief.json"
-        if not brief_path.is_file():
-            return True
-        try:
-            brief = json.loads(brief_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return True
-        return str(brief.get("development_target") or "MAIDAI_SOURCE") not in {
+        return str(self.brief.get("development_target") or "MAIDAI_SOURCE") not in {
             "RESEARCH_ONLY", "EXTERNAL_MOD_RESEARCH",
         }
 
@@ -310,7 +378,113 @@ class HarnessRunner:
         stderr_path.write_text("" if returncode == 0 else text, encoding="utf-8")
         self.commands.append(CommandResult(name, ["<internal>"], str(self.source), returncode, str(stdout_path), str(stderr_path)))
 
-    def _collect_artifacts(self, result: dict[str, Any]) -> None:
+    def _forge_addon_project(self) -> Path:
+        project_id = str(self.brief["project_id"])
+        project = (self.source / "rnd-projects" / project_id).resolve()
+        projects_root = (self.source / "rnd-projects").resolve()
+        if project.parent != projects_root:
+            raise ValidationFailure("RND_INVALID_PROJECT_ID", "Forge addon project path escaped rnd-projects")
+        if not project.is_dir():
+            raise ValidationFailure("FORGE_ADDON_PROJECT_MISSING", f"missing rnd-projects/{project_id}")
+        if not ((project / "build.gradle").is_file() or (project / "build.gradle.kts").is_file()):
+            raise ValidationFailure("FORGE_ADDON_PROJECT_INVALID", "Forge addon has no Gradle build file")
+        if not (project / "gradlew.bat").is_file() or not (project / "gradlew").is_file():
+            raise ValidationFailure("FORGE_ADDON_PROJECT_INVALID", "Forge addon Gradle wrapper scripts are missing")
+        if not (project / "gradle" / "wrapper").is_dir():
+            raise ValidationFailure("FORGE_ADDON_PROJECT_INVALID", "Forge addon gradle/wrapper directory is missing")
+        return project
+
+    def _build_and_validate_forge_addon(self) -> list[dict[str, Any]]:
+        project = self._forge_addon_project()
+        wrapper = project / ("gradlew.bat" if os.name == "nt" else "gradlew")
+        if os.name != "nt":
+            wrapper.chmod(wrapper.stat().st_mode | 0o111)
+        build = self._run_command(
+            "forge_addon_build", [str(wrapper), "build", "--no-daemon"], project,
+        )
+        if build.returncode != 0:
+            raise ValidationFailure("FORGE_ADDON_BUILD_FAILED", "independent Forge addon build failed")
+        jars = project / "build" / "libs"
+        validated: list[dict[str, Any]] = []
+        if jars.is_dir():
+            for jar in sorted(jars.glob("*.jar")):
+                lowered = jar.name.lower()
+                if lowered.endswith("-sources.jar") or lowered.endswith("-javadoc.jar"):
+                    continue
+                with contextlib.suppress(ValidationFailure, OSError, zipfile.BadZipFile, tomllib.TOMLDecodeError):
+                    validated.append(self._validate_forge_mod_jar(jar))
+        if not validated:
+            raise ValidationFailure(
+                "FORGE_ADDON_ARTIFACT_INVALID",
+                "build/libs contains no valid Minecraft 1.20.1 Forge Mod JAR",
+            )
+        return validated
+
+    def _validate_forge_mod_jar(self, jar: Path) -> dict[str, Any]:
+        with zipfile.ZipFile(jar) as archive:
+            names = set(archive.namelist())
+            if "META-INF/mods.toml" not in names or not any(name.endswith(".class") for name in names):
+                raise ValidationFailure("FORGE_ADDON_ARTIFACT_INVALID", "JAR lacks mods.toml or classes")
+            raw = tomllib.loads(archive.read("META-INF/mods.toml").decode("utf-8"))
+            manifest_text = (
+                archive.read("META-INF/MANIFEST.MF").decode("utf-8", errors="replace")
+                if "META-INF/MANIFEST.MF" in names else ""
+            )
+        loader = str(raw.get("modLoader") or "").lower()
+        if "javafml" not in loader and "forge" not in loader:
+            raise ValidationFailure("FORGE_ADDON_ARTIFACT_INVALID", "mods.toml is not Forge/JavaFML")
+        mods = raw.get("mods")
+        if not isinstance(mods, list) or not mods or not isinstance(mods[0], dict):
+            raise ValidationFailure("FORGE_ADDON_ARTIFACT_INVALID", "mods.toml has no mod metadata")
+        mod = mods[0]
+        mod_id = str(mod.get("modId") or "").strip()
+        version = str(mod.get("version") or "").strip()
+        if not mod_id:
+            raise ValidationFailure("FORGE_ADDON_ARTIFACT_INVALID", "mods.toml has no modId")
+        if not version or version.startswith("${"):
+            for line in manifest_text.splitlines():
+                if line.lower().startswith("implementation-version:"):
+                    version = line.split(":", 1)[1].strip()
+                    break
+        if not version or version.startswith("${"):
+            raise ValidationFailure("FORGE_ADDON_ARTIFACT_INVALID", "built JAR has no resolved version")
+
+        dependencies: list[dict[str, Any]] = []
+        dependency_root = raw.get("dependencies")
+        if isinstance(dependency_root, dict):
+            for rows in dependency_root.values():
+                if not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    if not isinstance(row, dict) or not row.get("modId"):
+                        continue
+                    dependencies.append({
+                        "modId": str(row["modId"]),
+                        "mandatory": bool(row.get("mandatory", False)),
+                        "versionRange": str(row.get("versionRange") or ""),
+                    })
+        minecraft = next((item for item in dependencies if item["modId"] == "minecraft"), None)
+        forge = next((item for item in dependencies if item["modId"] == "forge"), None)
+        if minecraft is None or "1.20.1" not in minecraft["versionRange"]:
+            raise ValidationFailure("FORGE_ADDON_ARTIFACT_INVALID", "JAR does not target Minecraft 1.20.1")
+        if forge is not None and "47" not in forge["versionRange"]:
+            raise ValidationFailure("FORGE_ADDON_ARTIFACT_INVALID", "Forge dependency conflicts with 47.x")
+        return {
+            "type": "forge_mod",
+            "name": str(mod.get("displayName") or mod_id),
+            "mod_id": mod_id,
+            "version": version,
+            "minecraft": "1.20.1",
+            "loader": "forge",
+            "dependencies": dependencies,
+            "source_path": str(jar),
+            "source_project": f"rnd-projects/{self.brief['project_id']}",
+            "build_status": "PASS",
+        }
+
+    def _collect_artifacts(
+        self, result: dict[str, Any], forge_artifacts: list[dict[str, Any]] | None = None,
+    ) -> None:
         artifacts = self.output / "artifacts"
         artifacts.mkdir(exist_ok=True)
         zip_path = artifacts / f"{self.cycle_id}-modified-source.zip"
@@ -332,6 +506,19 @@ class HarnessRunner:
                     "type": "build", "path": str(target),
                     "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
                 })
+        for metadata in forge_artifacts or []:
+            source_path = Path(str(metadata["source_path"])).resolve()
+            target = artifacts / source_path.name
+            if target.exists():
+                target = artifacts / f"{self.brief['project_id']}-{source_path.name}"
+            shutil.copy2(source_path, target)
+            item = {key: value for key, value in metadata.items() if key != "source_path"}
+            item.update({
+                "path": str(target),
+                "size": target.stat().st_size,
+                "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+            })
+            result["artifacts"].append(item)
 
     @staticmethod
     def _check(command: list[str], cwd: Path) -> None:

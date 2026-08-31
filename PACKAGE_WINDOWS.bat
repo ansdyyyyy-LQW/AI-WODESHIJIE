@@ -6,7 +6,7 @@ call BUILD_ALL_WINDOWS.bat
 if errorlevel 1 exit /b 1
 
 call .venv\Scripts\activate.bat
-python -m pip install pyinstaller PySide6 keyring
+python -m pip install -e control-center[package]
 python tools\package_windows.py
 if errorlevel 1 exit /b 1
 

@@ -2,7 +2,7 @@ name: Maid AI Windows Package
 
 on:
   push:
-    branches: [feature/maid-ai-project]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -10,82 +10,97 @@ permissions:
 
 jobs:
   package-windows:
-    if: ${{ !contains(github.event.head_commit.message || '', 'materialize Maid AI project source') || true }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Stop before source bootstrap
-        id: guard
-        shell: pwsh
-        run: |
-          if (Test-Path ".maid-ai-upload") {
-            "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          } else {
-            "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          }
-
-      - uses: actions/setup-java@v4
-        if: steps.guard.outputs.skip != 'true'
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - uses: gradle/actions/setup-gradle@v4
-        if: steps.guard.outputs.skip != 'true'
-        with:
-          gradle-version: '8.8'
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Build Forge Bridge
-        if: steps.guard.outputs.skip != 'true'
-        working-directory: maid-ai-project/maid-ai-bridge
-        run: gradle --no-daemon clean build --stacktrace
+        working-directory: maid-ai-bridge
+        shell: pwsh
+        run: .\gradlew.bat build --no-daemon
 
-      - uses: actions/setup-python@v5
-        if: steps.guard.outputs.skip != 'true'
+      - name: Set up Node 24.14.1
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.14.1'
+
+      - name: Set up pnpm 11.19.0
+        uses: pnpm/action-setup@v4
+        with:
+          version: '11.19.0'
+          run_install: false
+
+      - name: Build and test DeepSeek Harness integration
+        shell: pwsh
+        run: |
+          pnpm --dir dsh-integration install --frozen-lockfile
+          python tools/package_windows.py --check-dsh-lock --require-installed
+          pnpm --dir dsh-integration run build
+          pnpm --dir dsh-integration test
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: pip
           cache-dependency-path: |
-            maid-ai-project/agent-core/pyproject.toml
-            maid-ai-project/control-center/pyproject.toml
-            maid-ai-project/rnd-runner/pyproject.toml
+            agent-core/pyproject.toml
+            control-center/pyproject.toml
+            rnd-runner/pyproject.toml
 
-      - name: Install and test
-        if: steps.guard.outputs.skip != 'true'
-        working-directory: maid-ai-project
+      - name: Install Python projects and packaging tools
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e 'agent-core[test]' -e 'control-center[test,package]' -e 'rnd-runner[test]'
-          $env:QT_QPA_PLATFORM='offscreen'
-          $env:PYTHONPATH='agent-core/src;control-center/src;rnd-runner/src'
-          python -m pytest -q agent-core/tests control-center/tests rnd-runner/tests
+          python -m pip install -e 'agent-core[dev]' -e 'control-center[test,package]' -e 'rnd-runner[test]'
 
-      - name: Build Maid AI Control.exe
-        if: steps.guard.outputs.skip != 'true'
-        working-directory: maid-ai-project
+      - name: Build Windows package
         run: python tools/package_windows.py
 
       - name: Packaged EXE self-test
-        if: steps.guard.outputs.skip != 'true'
-        working-directory: maid-ai-project
         shell: pwsh
-        run: '& ".\dist\MaidAI\Maid AI Control.exe" --self-test'
+        run: |
+          $process = Start-Process -FilePath ".\dist\MaidAI\Maid AI Control.exe" -ArgumentList "--self-test" -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Packaged EXE self-test failed with exit code $($process.ExitCode)"
+          }
 
-      - name: Final package acceptance
-        if: steps.guard.outputs.skip != 'true'
-        working-directory: maid-ai-project
+      - name: Resolve the single production Bridge JAR
+        id: bridge
+        shell: pwsh
+        run: |
+          $jars = @(Get-ChildItem 'maid-ai-bridge/build/libs/MaidAI-Bridge-*.jar' -File | Where-Object { $_.Name -notmatch '-(sources|javadoc)\.jar$' })
+          if ($jars.Count -ne 1) {
+            throw "Expected exactly one production Bridge JAR, found $($jars.Count)"
+          }
+          "path=$($jars[0].FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Final Windows release acceptance
         env:
+          QT_QPA_PLATFORM: offscreen
           PYTHONPATH: agent-core/src;control-center/src;rnd-runner/src
-        run: python tools/final_acceptance.py --bridge-jar maid-ai-bridge/build/libs/MaidAI-Bridge-0.1.0.jar --windows-package dist/MaidAI --skip-tests
+        run: >-
+          python tools/final_acceptance.py
+          --release-check
+          --bridge-jar "${{ steps.bridge.outputs.path }}"
+          --windows-package dist/MaidAI
 
-      - name: Upload Windows release ZIP
-        if: steps.guard.outputs.skip != 'true'
+      - name: Upload Windows release ZIP and validation
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: MaidAI-Windows-0.1.0-Release
+          name: MaidAI-Windows-0.3.0-Release
           compression-level: 0
+          if-no-files-found: warn
           path: |
-            maid-ai-project/dist/MaidAI-Windows-0.1.0.zip
-            maid-ai-project/validation/*
+            dist/MaidAI-Windows-0.3.0.zip
+            validation/*

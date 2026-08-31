@@ -204,7 +204,7 @@ class HandoffBuilder:
                 copy_if_file(workspace / ".maidai-rnd" / filename, development_dir / filename)
         artifacts: list[dict[str, Any]] = []
 
-        def add_artifact(path_value: Any, artifact_type: str) -> None:
+        def add_artifact(path_value: Any, artifact_type: str, metadata: dict[str, Any] | None = None) -> None:
             candidate = Path(str(path_value or ""))
             if not candidate.is_absolute():
                 candidate = root / candidate
@@ -221,12 +221,18 @@ class HandoffBuilder:
                 "size": resolved.stat().st_size,
                 "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
             }
+            for key in (
+                "name", "mod_id", "version", "minecraft", "loader", "dependencies",
+                "source_project", "build_status", "requires_user_action",
+            ):
+                if metadata is not None and key in metadata:
+                    record[key] = metadata[key]
             if record not in artifacts:
                 artifacts.append(record)
 
         for item in list(runner.get("artifacts") or []):
             if isinstance(item, dict):
-                add_artifact(item.get("path"), str(item.get("type") or "build"))
+                add_artifact(item.get("path"), str(item.get("type") or "build"), item)
         for relative, artifact_type in (
             ("output/rnd_result.json", "result"),
             ("output/development/dsh_result.json", "dsh_result"),
@@ -241,11 +247,15 @@ class HandoffBuilder:
             add_artifact(root / relative, artifact_type)
 
         validation_status = "PASS" if validator.get("ok") is True else "FAIL"
+        requires_user_action = outcome == "WAITING_USER" or any(
+            item.get("type") == "forge_mod" or item.get("requires_user_action") is True
+            for item in artifacts
+        )
         manifest = {
             "cycle_id": cycle.cycle_id,
             "status": outcome,
             "mode": "FULL_HARNESS",
-            "requires_user_action": outcome == "WAITING_USER",
+            "requires_user_action": requires_user_action,
             "summary": str(validator.get("summary") or deepseek.get("summary") or outcome),
             "production_version": self._production_version(),
             "source_baseline": cycle.baseline_commit or "",
@@ -290,11 +300,29 @@ class HandoffBuilder:
             ) + "\n",
             encoding="utf-8",
         )
-        (root / "USER_ACTION_REQUIRED.md").write_text(
-            f"研发完成：{'是' if outcome in {'COMPLETED', 'STAGE_COMPLETED'} else '否'}\n"
-            f"需要人工操作：{'是' if manifest['requires_user_action'] else '否'}\n",
-            encoding="utf-8",
-        )
+        forge_mods = [item for item in artifacts if item.get("type") == "forge_mod"]
+        if forge_mods:
+            mod_lines = "\n".join(
+                f"- {item.get('name') or item.get('mod_id')}: {item.get('path')}"
+                for item in forge_mods
+            )
+            action_text = (
+                "AI研发已经成功生成新的 Forge Mod。\n\n"
+                "需要人工操作：是\n\n"
+                "1. 关闭 Minecraft。\n"
+                "2. 打开本次研发成果文件夹。\n"
+                "3. 将列出的 Forge Mod JAR 放入目标 Minecraft 1.20.1 实例的 mods 文件夹。\n"
+                "4. 如果列出了额外依赖，同时安装对应依赖。\n"
+                "5. 重新启动 Minecraft。\n"
+                "6. 确认模组正常加载后，在 MaidAI 中标记为已处理。\n\n"
+                "## 本次 Forge Mod\n\n" + mod_lines + "\n"
+            )
+        else:
+            action_text = (
+                f"研发完成：{'是' if outcome in {'COMPLETED', 'STAGE_COMPLETED'} else '否'}\n"
+                f"需要人工操作：{'是' if manifest['requires_user_action'] else '否'}\n"
+            )
+        (root / "USER_ACTION_REQUIRED.md").write_text(action_text, encoding="utf-8")
         (root / "validation" / "test-results.txt").write_text(
             json.dumps(manifest["validation"], ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
@@ -314,6 +342,9 @@ class HandoffBuilder:
                 errors.append(f"missing:{key}")
         root = Path(path).parent.resolve()
         for artifact in data.get("artifacts", []):
+            if not isinstance(artifact, dict):
+                errors.append("invalid_artifact")
+                continue
             relative = str(artifact.get("path", ""))
             candidate = Path(relative)
             if not relative or candidate.is_absolute() or ".." in candidate.parts:
@@ -324,11 +355,19 @@ class HandoffBuilder:
                 resolved.relative_to(root)
             except ValueError:
                 errors.append(f"unsafe_artifact_path:{relative}")
+                continue
+            if not resolved.is_file():
+                errors.append(f"missing_artifact:{relative}")
             if artifact.get("type") == "forge_mod":
+                for key in ("mod_id", "version", "build_status"):
+                    if not str(artifact.get(key) or "").strip():
+                        errors.append(f"missing_forge_{key}:{relative}")
                 if artifact.get("minecraft") != "1.20.1":
                     errors.append(f"wrong_minecraft:{relative}")
                 if str(artifact.get("loader", "")).lower() != "forge":
                     errors.append(f"wrong_loader:{relative}")
+                if artifact.get("build_status") != "PASS":
+                    errors.append(f"forge_build_not_passed:{relative}")
         return errors
 
     @staticmethod

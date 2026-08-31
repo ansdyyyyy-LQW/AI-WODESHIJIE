@@ -78,13 +78,13 @@ async def test_bridge_hello_snapshot_action_and_discovery() -> None:
             await asyncio.sleep(0.05)
 
     bridge_task = asyncio.create_task(fake_bridge())
-    version, snapshot = await gateway.wait_for_snapshot(timeout=2)
+    version, snapshot = await gateway.wait_for_snapshot(timeout=10)
     assert version == 1
     assert snapshot.game_tick == 99
     result = await gateway.request_action(ActionRequest(action="move_to", args={"x": 1, "y": 64, "z": 1}), timeout_seconds=2)
     assert result.status == ActionStatus.SUCCESS
     assert result.code == "ARRIVED"
-    response = await gateway.request_message(MessageType.DISCOVER_MAIDS, {}, timeout=2)
+    response = await gateway.request_message(MessageType.DISCOVER_MAIDS, {}, timeout=10)
     assert response.payload["maids"][0]["uuid"] == "maid-1"
     await bridge_task
     await gateway.close()

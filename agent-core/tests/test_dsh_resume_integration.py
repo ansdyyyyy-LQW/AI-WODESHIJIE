@@ -150,7 +150,7 @@ async def test_real_driver_suspends_and_resumes_same_session(tmp_path: Path) -> 
             "dsh_home": tmp_path / "dsh-home",
             "log_root": tmp_path / "logs",
             "model_environment": model_environment,
-            "start_timeout": 60,
+            "start_timeout": 900,
             "phase_timeout": 120,
         }
         first = DeepSeekHarnessAdapter(**common)

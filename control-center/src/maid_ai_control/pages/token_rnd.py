@@ -227,9 +227,16 @@ class TokenRndPage(Page):
         self.rnd_cards["staging"].set_value("需要" if feasible is False or project_size == "BEYOND_CYCLE" else ("不需要" if feasible is True else "尚未判断"))
         direction = public_model_text(planning.get("direction") or budget_plan.get("direction"), "未命名研发成果")
         value = public_model_text(planning.get("value_reason") or budget_plan.get("value_reason"), "改善女仆 AI 的能力")
-        self.result_name.setText(direction)
+        forge_mods = [
+            item for item in list(self.latest_cycle.get("artifacts") or [])
+            if isinstance(item, dict) and item.get("type") == "forge_mod"
+        ]
+        self.result_name.setText("新 Mod" if forge_mods else direction)
         self.result_use.setText(value)
-        self.result_state.setText("已安全暂停，启动后自动继续" if status == "SUSPENDED" else OUTCOME_TEXT.get(outcome, PHASE_TEXT.get(phase, "正在进行")))
+        self.result_state.setText(
+            "研发成功" if forge_mods and outcome in {"COMPLETED", "STAGE_COMPLETED"}
+            else ("已安全暂停，启动后自动继续" if status == "SUSPENDED" else OUTCOME_TEXT.get(outcome, PHASE_TEXT.get(phase, "正在进行")))
+        )
         validator = dict(self.latest_cycle.get("final_validator") or {})
         if validator.get("ok") is True:
             validator_text = "通过"
@@ -239,9 +246,14 @@ class TokenRndPage(Page):
             validator_text = "等待验证"
         self.rnd_cards["validator"].set_value(validator_text)
         artifact_count = int(self.latest_cycle.get("artifact_count") or 0)
-        self.artifact_state.setText(f"{artifact_count} 个已登记文件" if artifact_count else "尚无已登记文件")
+        self.artifact_state.setText(
+            f"{len(forge_mods)} 个 Forge Mod" if forge_mods
+            else (f"{artifact_count} 个已登记文件" if artifact_count else "尚无已登记文件")
+        )
         handled = bool(self.latest_cycle.get("handled"))
-        if outcome == "WAITING_USER":
+        if forge_mods:
+            user_action = "需要安装并重启 Minecraft"
+        elif outcome == "WAITING_USER":
             user_action = "请查看说明和测试结果，再决定是否继续"
         elif outcome in {"COMPLETED", "STAGE_COMPLETED"} and not handled:
             user_action = "请查看成果；确认后可标记为已处理"
@@ -320,7 +332,7 @@ class TokenRndPage(Page):
         root = self._artifact()
         if not root:
             return
-        for name in ("output/rnd_result.json", "RND_REPORT.md", "README.md", "readme.md", "rnd_result.json", "summary.md"):
+        for name in ("USER_ACTION_REQUIRED.md", "RND_REPORT.md", "output/rnd_result.json", "README.md", "readme.md", "rnd_result.json", "summary.md"):
             candidate = root / name
             if candidate.exists():
                 self._open(candidate)

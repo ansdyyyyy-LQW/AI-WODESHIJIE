@@ -73,7 +73,10 @@ class RndDevelopmentBrief(BaseModel):
         gaps = [item for item in gaps_raw if isinstance(item, dict)][:200]
         allowed_by_target = {
             RndDevelopmentTarget.MAIDAI_SOURCE: [
-                "agent-core/", "maid-ai-bridge/", "control-center/", "rnd-runner/", "docs/", "tests/",
+                "agent-core/", "maid-ai-bridge/", "control-center/", "rnd-runner/",
+                "dsh-integration/", "tools/", "docs/", ".github/",
+                "BUILD_ALL_WINDOWS.bat", "PACKAGE_WINDOWS.bat", "README.md",
+                "README_CN.txt", "CHANGELOG.md",
             ],
             RndDevelopmentTarget.NEW_FORGE_ADDON: ["rnd-projects/<project-id>/"],
             RndDevelopmentTarget.SKILL: ["agent-core/", ".maidai-rnd/candidates/"],

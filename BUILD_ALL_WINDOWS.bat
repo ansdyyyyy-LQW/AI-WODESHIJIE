@@ -33,7 +33,11 @@ where pnpm >nul 2>&1 || (
   echo [ERROR] 未检测到 pnpm。Windows 打包需要先安装锁定的 DSH 依赖。
   exit /b 1
 )
+%PY% tools\package_windows.py --check-dsh-lock
+if errorlevel 1 exit /b 1
 call pnpm --dir dsh-integration install --frozen-lockfile --prod=false
+if errorlevel 1 exit /b 1
+%PY% tools\package_windows.py --check-dsh-lock --require-installed
 if errorlevel 1 exit /b 1
 call pnpm --dir dsh-integration run build
 if errorlevel 1 exit /b 1
@@ -54,3 +58,4 @@ python tools\validate_source.py
 if errorlevel 1 exit /b 1
 
 echo [OK] Java、Python 与 DeepSeek Harness 构建/测试完成。
+exit /b 0

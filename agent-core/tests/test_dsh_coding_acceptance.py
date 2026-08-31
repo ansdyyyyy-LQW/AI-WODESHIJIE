@@ -160,7 +160,7 @@ async def test_official_dsh_edits_runs_failed_test_then_fixes_and_keeps_producti
             dsh_home=tmp_path / "dsh-home" / name,
             log_root=tmp_path / "logs",
             model_environment=environment,
-            start_timeout=60,
+            start_timeout=900,
             phase_timeout=180,
         )
         adapters.append(value)

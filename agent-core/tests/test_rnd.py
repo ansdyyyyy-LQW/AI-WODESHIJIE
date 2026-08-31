@@ -92,6 +92,7 @@ def test_final_handoff_and_cycle_list_expose_dsh_validator_and_artifacts(tmp_pat
     manifest = builder.finalize_cycle(cycle, summary)
 
     assert manifest["validation"]["status"] == "PASS"
+    assert manifest["requires_user_action"] is False
     assert manifest["deepseek_harness"]["session_id"] == "session-resumable"
     assert manifest["artifacts"][0]["sha256"]
     assert builder.validate_manifest(cycle.artifact_dir / "handoff_manifest.json") == []
@@ -99,6 +100,52 @@ def test_final_handoff_and_cycle_list_expose_dsh_validator_and_artifacts(tmp_pat
     assert listed["final_validator"]["ok"] is True
     assert listed["artifact_count"] >= 1
     assert listed["dsh_phase_progress"]["completed"] == ["RESEARCH", "DESIGN"]
+
+
+def test_forge_mod_handoff_preserves_metadata_and_requires_manual_install(tmp_path) -> None:
+    store = MemoryStore(tmp_path / "state.sqlite3")
+    cycle = RndTrigger(store, tmp_path / "handoff", cycle_days=5, budget=100_000).create(5)
+    validator = cycle.artifact_dir / "output" / "final-validator"
+    artifact = validator / "artifacts" / "examplemod-1.0.0.jar"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"verified forge mod")
+    runner = {
+        "ok": True,
+        "changed_files": ["rnd-projects/project-a/build.gradle"],
+        "commands": [{"name": "forge_addon_build", "returncode": 0}],
+        "artifacts": [{
+            "type": "forge_mod", "name": "Example Mod", "mod_id": "examplemod",
+            "version": "1.0.0", "minecraft": "1.20.1", "loader": "forge",
+            "dependencies": [{"modId": "minecraft", "mandatory": True, "versionRange": "[1.20.1,1.21)"}],
+            "path": str(artifact), "source_project": "rnd-projects/project-a",
+            "build_status": "PASS",
+        }],
+    }
+    summary = {
+        "outcome": "COMPLETED",
+        "deepseek_harness": {"ok": True, "completed_phases": []},
+        "final_validator": {
+            "ok": True, "code": "SUCCESS", "summary": "validated",
+            "details": {"runner_result": runner},
+        },
+    }
+    builder = HandoffBuilder(store, SkillStore(store), Scoreboard(), tmp_path)
+    manifest = builder.finalize_cycle(cycle, summary)
+    mod = next(item for item in manifest["artifacts"] if item["type"] == "forge_mod")
+    assert manifest["requires_user_action"] is True
+    assert mod["mod_id"] == "examplemod" and mod["version"] == "1.0.0"
+    assert mod["source_project"] == "rnd-projects/project-a"
+    assert builder.validate_manifest(cycle.artifact_dir / "handoff_manifest.json") == []
+    instructions = (cycle.artifact_dir / "USER_ACTION_REQUIRED.md").read_text(encoding="utf-8")
+    assert "需要人工操作：是" in instructions and "关闭 Minecraft" in instructions
+
+    del mod["mod_id"]
+    del mod["minecraft"]
+    invalid_path = cycle.artifact_dir / "invalid-handoff.json"
+    invalid_path.write_text(json.dumps(manifest), encoding="utf-8")
+    errors = builder.validate_manifest(invalid_path)
+    assert any(error.startswith("missing_forge_mod_id:") for error in errors)
+    assert any(error.startswith("wrong_minecraft:") for error in errors)
 
 
 def test_cycle_creation_is_atomic_and_never_reuses_an_active_cycle(tmp_path) -> None:

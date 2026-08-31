@@ -29,7 +29,7 @@ class DeepSeekHarnessAdapter:
         log_root: Path,
         model_environment: Mapping[str, str] | None = None,
         event_handler: EventHandler | None = None,
-        start_timeout: float = 180,
+        start_timeout: float = 900,
         phase_timeout: float = 1800,
     ) -> None:
         self.node_executable = str(node_executable or "")
