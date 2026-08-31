@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import shutil
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import pytest
@@ -18,6 +20,17 @@ from maid_agent.rnd.trigger import RndTrigger
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _pwsh_calc_check(calc_file: Path) -> str:
+    quoted = str(calc_file).replace("'", "''")
+    return (
+        "$ErrorActionPreference = 'Stop'; "
+        f"$source = Get-Content -Raw -LiteralPath '{quoted}'; "
+        "if (-not $source.Contains('return a + b;')) { "
+        "throw 'calc acceptance failed' }; "
+        "Write-Output 'calc acceptance passed'"
+    )
 
 
 def _text(value: Any) -> str:
@@ -68,11 +81,14 @@ async def test_official_dsh_edits_runs_failed_test_then_fixes_and_keeps_producti
     launcher = ROOT / "dsh-integration" / "lib" / "launcher.js"
     if not launcher.is_file():
         pytest.skip("build dsh-integration before running the integration acceptance")
+    node = shutil.which("node")
+    assert node is not None, "Node runtime is required for the real DSH integration acceptance"
     requests: list[dict[str, Any]] = []
     emitted_tools: list[str] = []
     active = {"mode": "calc_fail"}
     call_counts = {"calc_fail": 0, "calc_fix": 0, "maidai": 0}
-    outside_target = tmp_path / "outside-workspace-write-must-fail.txt"
+    outside_target = ROOT / "docs" / "dsh_outside_workspace_write_must_fail.txt"
+    assert not outside_target.exists()
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -84,51 +100,61 @@ async def test_official_dsh_edits_runs_failed_test_then_fixes_and_keeps_producti
             length = int(self.headers.get("content-length", "0"))
             body = json.loads(self.rfile.read(length))
             requests.append(body)
-            mode = active["mode"]
-            index = call_counts[mode]
-            call_counts[mode] += 1
-            if mode == "calc_fail":
-                steps = [
-                    _tool("calc-read", "read", {"file_path": "calc.js"}),
-                    _tool("calc-outside", "write", {
-                        "file_path": str(outside_target),
-                        "content": "this write must be rejected\n",
-                    }),
-                    _tool("calc-fail", "pwsh", {
-                        "command": "node --test test_calc.mjs",
-                        "description": "Run failing calculation test",
-                        "workdir": ".",
-                    }),
-                ]
-                payload = steps[index] if index < len(steps) else _done("failing test captured")
-            elif mode == "calc_fix":
-                steps = [
-                    _tool("calc-reread", "read", {"file_path": "calc.js"}),
-                    _tool("calc-edit", "edit", {
-                        "file_path": "calc.js",
-                        "old_string": "  return a - b;\n",
-                        "new_string": "  return a + b;\n",
-                    }),
-                    _tool("calc-pass", "pwsh", {
-                        "command": "node --test test_calc.mjs",
-                        "description": "Run repaired calculation test",
-                        "workdir": ".",
-                    }),
-                ]
-                payload = steps[index] if index < len(steps) else _done("calc fixed and tested")
+            if not body.get("tools"):
+                # DSH creates a title with a separate, tool-free model request.
+                # It must not consume one of the scripted production tool steps.
+                payload = _done("MaidAI DSH acceptance")
             else:
-                steps = [
-                    _tool("maidai-write", "write", {
-                        "file_path": "docs/dsh_workspace_isolation_acceptance.md",
-                        "content": "DSH isolated workspace acceptance\n",
-                    }),
-                    _tool("maidai-diff", "pwsh", {
-                        "command": "git add -N -- docs/dsh_workspace_isolation_acceptance.md; git diff -- docs/dsh_workspace_isolation_acceptance.md",
-                        "description": "Show isolated workspace source diff",
-                        "workdir": ".",
-                    }),
-                ]
-                payload = steps[index] if index < len(steps) else _done("isolated workspace changed")
+                mode = active["mode"]
+                index = call_counts[mode]
+                call_counts[mode] += 1
+                if mode == "calc_fail":
+                    steps = [
+                        _tool("calc-read", "read", {"file_path": "calc.js"}),
+                        _tool("calc-outside", "write", {
+                            "file_path": str(outside_target),
+                            "content": "this write must be rejected\n",
+                        }),
+                        _tool("calc-fail", "pwsh", {
+                            "command": _pwsh_calc_check(calc / "calc.js"),
+                            "description": "Run failing calculation test",
+                            "workdir": ".",
+                        }),
+                    ]
+                    payload = steps[index] if index < len(steps) else _done("failing test captured")
+                elif mode == "calc_fix":
+                    steps = [
+                        _tool("calc-reread", "read", {"file_path": "calc.js"}),
+                        _tool("calc-edit", "edit", {
+                            "file_path": "calc.js",
+                            "old_string": "  return a - b;\n",
+                            "new_string": "  return a + b;\n",
+                        }),
+                        _tool("calc-pass", "pwsh", {
+                            "command": _pwsh_calc_check(calc / "calc.js"),
+                            "description": "Run repaired calculation test",
+                            "workdir": ".",
+                        }),
+                    ]
+                    payload = steps[index] if index < len(steps) else _done("calc fixed and tested")
+                else:
+                    steps = [
+                        _tool("maidai-write", "write", {
+                            "file_path": "docs/dsh_workspace_isolation_acceptance.md",
+                            "content": "DSH isolated workspace acceptance\n",
+                        }),
+                        _tool("maidai-diff", "pwsh", {
+                            "command": (
+                                f"git -C '{str(workspace).replace(chr(39), chr(39) * 2)}' add -N -- "
+                                "docs/dsh_workspace_isolation_acceptance.md; "
+                                f"git -C '{str(workspace).replace(chr(39), chr(39) * 2)}' diff -- "
+                                "docs/dsh_workspace_isolation_acceptance.md"
+                            ),
+                            "description": "Show isolated workspace source diff",
+                            "workdir": ".",
+                        }),
+                    ]
+                    payload = steps[index] if index < len(steps) else _done("isolated workspace changed")
 
             tool_calls = payload.get("choices", [{}])[0].get("delta", {}).get("tool_calls", [])
             if tool_calls:
@@ -146,6 +172,10 @@ async def test_official_dsh_edits_runs_failed_test_then_fixes_and_keeps_producti
     thread = threading.Thread(target=server.serve_forever, name="dsh-coding-acceptance", daemon=True)
     thread.start()
     adapters: list[DeepSeekHarnessAdapter] = []
+    workspace_parent = ROOT / ".test-tmp"
+    workspace_parent.mkdir(exist_ok=True)
+    workspace_temp = TemporaryDirectory(prefix="dsh-coding-", dir=workspace_parent)
+    isolated_root = Path(workspace_temp.name)
     environment = {
         "DEEPSEEK_BASE_URL": f"http://127.0.0.1:{server.server_port}",
         "DEEPSEEK_SEARCH_BASE_URL": f"http://127.0.0.1:{server.server_port}",
@@ -155,7 +185,7 @@ async def test_official_dsh_edits_runs_failed_test_then_fixes_and_keeps_producti
 
     def adapter(name: str) -> DeepSeekHarnessAdapter:
         value = DeepSeekHarnessAdapter(
-            node_executable="C:/Program Files/nodejs/node.exe",
+            node_executable=node,
             launcher_path=launcher,
             dsh_home=tmp_path / "dsh-home" / name,
             log_root=tmp_path / "logs",
@@ -167,7 +197,7 @@ async def test_official_dsh_edits_runs_failed_test_then_fixes_and_keeps_producti
         return value
 
     try:
-        calc = tmp_path / "calc-project"
+        calc = isolated_root / "calc-project"
         calc.mkdir()
         (calc / "calc.js").write_text(
             "exports.add = function add(a, b) {\n  return a - b;\n};\n",
@@ -181,7 +211,7 @@ async def test_official_dsh_edits_runs_failed_test_then_fixes_and_keeps_producti
             encoding="utf-8",
         )
         initial = subprocess.run(
-            ["node", "--test", "test_calc.mjs"], cwd=calc,
+            [node, "--test", "test_calc.mjs"], cwd=calc,
             text=True, encoding="utf-8", errors="replace", capture_output=True,
         )
         assert initial.returncode != 0, initial.stdout + initial.stderr
@@ -192,7 +222,12 @@ async def test_official_dsh_edits_runs_failed_test_then_fixes_and_keeps_producti
             task="CALC_ACCEPTANCE open the code and run the currently failing test",
             phase="DEVELOPMENT",
         )
-        assert calc_result.ok
+        assert not calc_result.ok
+        assert calc_result.finish_reason == "tool_failed"
+        assert calc_result.raw["tool_state"]["ok"] is False
+        assert {row["tool"] for row in calc_result.raw["tool_state"]["unresolved_failures"]} >= {
+            "write", "pwsh",
+        }
         assert not outside_target.exists()
         active["mode"] = "calc_fix"
         fix_result = await calc_adapter.run_phase(
@@ -202,11 +237,13 @@ async def test_official_dsh_edits_runs_failed_test_then_fixes_and_keeps_producti
             phase="BUILD_FIX",
         )
         assert fix_result.ok
+        assert fix_result.raw["tool_state"]["ok"] is True
+        assert fix_result.raw["tool_state"]["workspace_changed"] is True
         assert "return a + b" in (calc / "calc.js").read_text(encoding="utf-8"), (
             f"calls={call_counts!r} tools={emitted_tools!r} raw={fix_result.raw!r}"
         )
         completed = subprocess.run(
-            ["node", "--test", "test_calc.mjs"], cwd=calc,
+            [node, "--test", "test_calc.mjs"], cwd=calc,
             text=True, encoding="utf-8", errors="replace", capture_output=True,
         )
         assert completed.returncode == 0, completed.stdout + completed.stderr
@@ -220,7 +257,7 @@ async def test_official_dsh_edits_runs_failed_test_then_fixes_and_keeps_producti
         harness = RndHarness(
             runner_path=str(ROOT / "rnd-runner" / "src" / "maid_rnd_runner" / "main.py"),
             source_workspace=ROOT,
-            work_root=tmp_path / "workspaces",
+            work_root=isolated_root / "workspaces",
         )
         state = harness.prepare_workspace(cycle)
         workspace = Path(state["workspace"])
@@ -232,6 +269,8 @@ async def test_official_dsh_edits_runs_failed_test_then_fixes_and_keeps_producti
             phase="DEVELOPMENT",
         )
         assert maidai_result.ok
+        assert maidai_result.raw["tool_state"]["ok"] is True
+        assert "docs/dsh_workspace_isolation_acceptance.md" in maidai_result.raw["tool_state"]["changed_paths"]
         marker = workspace / "docs" / "dsh_workspace_isolation_acceptance.md"
         assert marker.read_text(encoding="utf-8") == "DSH isolated workspace acceptance\n"
         subprocess.run(
@@ -256,3 +295,4 @@ async def test_official_dsh_edits_runs_failed_test_then_fixes_and_keeps_producti
         server.shutdown()
         server.server_close()
         await asyncio.to_thread(thread.join, 5)
+        workspace_temp.cleanup()

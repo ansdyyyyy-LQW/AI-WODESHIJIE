@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -52,7 +53,9 @@ async def test_real_driver_suspends_and_resumes_same_session(tmp_path: Path) -> 
             after_latest_user.reverse()
             tool_messages = [item for item in after_latest_user if item.get("role") == "tool"]
 
-            if "RESUME_STEP" in latest_user:
+            if not body.get("tools"):
+                payload = self._text_response("MaidAI resume acceptance")
+            elif "RESUME_STEP" in latest_user:
                 if len(tool_messages) == 0:
                     payload = self._tool("resume-read", "read", {"file_path": "resume-marker.txt"})
                 elif len(tool_messages) == 1:
@@ -122,6 +125,8 @@ async def test_real_driver_suspends_and_resumes_same_session(tmp_path: Path) -> 
         launcher = root / "dsh-integration" / "lib" / "launcher.js"
         if not launcher.is_file():
             pytest.skip("build dsh-integration before running the integration test")
+        node = shutil.which("node")
+        assert node is not None, "Node runtime is required for the real DSH resume integration"
         workspace = tmp_path / "workspace"
         workspace.mkdir()
         store = MemoryStore(tmp_path / "state.sqlite3")
@@ -145,7 +150,7 @@ async def test_real_driver_suspends_and_resumes_same_session(tmp_path: Path) -> 
         model_environment = await proxy.start(cycle_id=cycle.cycle_id, phase="DEVELOPMENT")
         session_id = f"maidai-rnd-{cycle.cycle_id}"
         common = {
-            "node_executable": "C:/Program Files/nodejs/node.exe",
+            "node_executable": node,
             "launcher_path": launcher,
             "dsh_home": tmp_path / "dsh-home",
             "log_root": tmp_path / "logs",

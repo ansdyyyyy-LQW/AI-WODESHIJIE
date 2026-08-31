@@ -95,12 +95,20 @@ jobs:
           --windows-package dist/MaidAI
 
       - name: Upload Windows release ZIP and validation
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: MaidAI-Windows-0.3.0-Release
           compression-level: 0
-          if-no-files-found: warn
+          if-no-files-found: error
           path: |
             dist/MaidAI-Windows-0.3.0.zip
             validation/*
+
+      - name: Upload failed Windows validation
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MaidAI-Windows-0.3.0-Failed-Validation
+          if-no-files-found: warn
+          path: validation/*

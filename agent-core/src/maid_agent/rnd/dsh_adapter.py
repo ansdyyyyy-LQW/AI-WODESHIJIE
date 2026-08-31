@@ -173,6 +173,27 @@ class DeepSeekHarnessAdapter:
                 handle.write(chunk)
                 handle.flush()
 
+    @staticmethod
+    def _prepare_windows_workspace_acl(workspace: Path) -> None:
+        if os.name != "nt":
+            return
+        # DSH's Windows restricted token intersects reads with the Everyone SID.
+        # User-private/temp directories often omit that read ACE, which otherwise
+        # makes confined pwsh unable to read even its own isolated workspace.
+        # Add read/execute only; DSH keeps write authority confined to its
+        # workspace capability SID.
+        completed = subprocess.run(
+            [
+                "icacls.exe", str(workspace),
+                "/grant", "*S-1-1-0:(OI)(CI)RX", "/T", "/Q",
+            ],
+            text=True, encoding="utf-8", errors="replace", capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise RuntimeError(f"Unable to prepare isolated DSH workspace read ACL: {detail}")
+
     async def _launch(self, workspace: Path, session_id: str) -> None:
         if self.process is not None and self.process.returncode is None:
             if self.workspace != workspace or self.session_id != session_id:
@@ -184,6 +205,7 @@ class DeepSeekHarnessAdapter:
         workspace = workspace.resolve()
         if not workspace.is_dir():
             raise FileNotFoundError(f"R&D workspace is missing: {workspace}")
+        self._prepare_windows_workspace_acl(workspace)
         self.dsh_home.mkdir(parents=True, exist_ok=True)
         self.log_root.mkdir(parents=True, exist_ok=True)
         self.workspace = workspace
@@ -251,14 +273,18 @@ class DeepSeekHarnessAdapter:
                 )
             if message.type == "result":
                 reason = str(message.payload.get("finish_reason") or "unknown")
+                tool_state = message.payload.get("tool_state")
+                tool_ok = isinstance(tool_state, dict) and tool_state.get("ok") is True
+                completed = reason == "completed" and tool_ok
+                effective_reason = reason if reason != "completed" or tool_ok else "tool_failed"
                 usage_raw = message.payload.get("usage") or {}
                 usage = {
                     str(key): int(value) for key, value in usage_raw.items()
                     if isinstance(value, int) and not isinstance(value, bool)
                 } if isinstance(usage_raw, dict) else {}
                 return DshRunResult(
-                    reason == "completed", "SUCCESS" if reason == "completed" else reason.upper(),
-                    reason, str(message.payload.get("summary") or ""), self.session_id,
+                    completed, "SUCCESS" if completed else effective_reason.upper(),
+                    effective_reason, str(message.payload.get("summary") or ""), self.session_id,
                     str(self.workspace), phase, usage=usage, events=events, raw=message.payload,
                 )
 
